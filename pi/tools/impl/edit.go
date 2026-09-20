@@ -1,4 +1,4 @@
-package tools
+package impl
 
 import (
 	"bytes"
@@ -13,8 +13,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/PycMono/go-reagent/pi/ai"
-	pierrors "github.com/PycMono/go-reagent/pi/errors"
+	pierrors "github.com/PycMono/go-harness/pi/error"
+	"github.com/PycMono/go-harness/pi/schema"
+	"github.com/PycMono/go-harness/pi/tools"
 )
 
 type EditOperation struct {
@@ -29,14 +30,20 @@ type EditDetails struct {
 	FirstChangedLine int    `json:"firstChangedLine"`
 }
 
-type EditTool struct{ workspace *Workspace }
+// EditTool 对已有文本文件执行一批原子替换：每个 oldText 必须在原内容中唯一
+// 匹配，且各自的范围互不重叠。
+type EditTool struct{ workDir string }
 
-func NewEditTool(workspace *Workspace) *EditTool { return &EditTool{workspace: workspace} }
+func NewEditTool(workDir string) *EditTool { return &EditTool{workDir: workDir} }
 
-func (t *EditTool) Definition() ai.ToolDefinition {
-	return ai.ToolDefinition{
-		Name:        "edit",
-		Description: "对工作区内的现有 UTF-8 文本文件执行一批原子替换；每个 oldText 必须在原始内容中唯一匹配，且范围不得重叠。",
+var _ tools.Tool = (*EditTool)(nil)
+
+func (t *EditTool) Definition() schema.ToolDefinition {
+	return schema.ToolDefinition{
+		Name:         "edit",
+		Label:        "Edit",
+		ParallelSafe: false,
+		Description:  "对现有 UTF-8 文本文件执行一批原子替换；每个 oldText 必须在原始内容中唯一匹配，且范围不得重叠。",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -61,17 +68,13 @@ func (t *EditTool) Definition() ai.ToolDefinition {
 	}
 }
 
-func (t *EditTool) Execute(ctx context.Context, args json.RawMessage, _ ai.UpdateEmitter) (ai.ToolOutput, error) {
+func (t *EditTool) Execute(ctx context.Context, args json.RawMessage, _ *tools.UpdateEmitter) (*schema.ToolOutput, error) {
 	output, details, err := t.executeWithDetails(ctx, args)
 	if err != nil {
-		return ai.ToolOutput{}, err
+		return nil, err
 	}
-	return ai.ToolOutput{Content: []ai.ContentBlock{ai.TextBlock(output)}, Details: details}, nil
-}
 
-func (t *EditTool) execute(ctx context.Context, args json.RawMessage) (string, error) {
-	output, _, err := t.executeWithDetails(ctx, args)
-	return output, err
+	return textOutputWithDetails(output, details), nil
 }
 
 func (t *EditTool) executeWithDetails(ctx context.Context, args json.RawMessage) (string, EditDetails, error) {
@@ -83,7 +86,7 @@ func (t *EditTool) executeWithDetails(ctx context.Context, args json.RawMessage)
 	if err != nil {
 		return "", EditDetails{}, err
 	}
-	path, err := cleanRelativePath(input.Path, true)
+	path, err := resolvePath(t.workDir, input.Path)
 	if err != nil {
 		return "", EditDetails{}, err
 	}
@@ -102,25 +105,16 @@ func (t *EditTool) executeWithDetails(ctx context.Context, args json.RawMessage)
 	if err := ctx.Err(); err != nil {
 		return "", EditDetails{}, fmt.Errorf("修改已取消: %w", err)
 	}
-	info, err := t.workspace.Stat(path)
+	info, err := os.Stat(path)
 	if err != nil {
-		return "", EditDetails{}, fmt.Errorf("检查文件失败: %w", err)
+		return "", EditDetails{}, pierrors.ErrToolResourceNotFound.Wrap(fmt.Errorf("检查文件失败: %w", err))
 	}
 	if !info.Mode().IsRegular() {
 		return "", EditDetails{}, errors.New("只允许修改普通文件")
 	}
-	file, err := t.workspace.OpenFile(path, os.O_RDWR, 0)
+	contentBytes, err := os.ReadFile(path)
 	if err != nil {
-		return "", EditDetails{}, fmt.Errorf("打开文件失败: %w", err)
-	}
-	defer file.Close()
-	if err := ctx.Err(); err != nil {
-		return "", EditDetails{}, fmt.Errorf("修改已取消: %w", err)
-	}
-
-	contentBytes, err := io.ReadAll(file)
-	if err != nil {
-		return "", EditDetails{}, fmt.Errorf("读取文件内容失败: %w", err)
+		return "", EditDetails{}, pierrors.ErrToolResourceNotFound.Wrap(fmt.Errorf("读取文件内容失败: %w", err))
 	}
 	if !utf8.Valid(contentBytes) {
 		return "", EditDetails{}, errors.New("文件内容不是有效的 UTF-8 文本")
@@ -157,18 +151,8 @@ func (t *EditTool) executeWithDetails(ctx context.Context, args json.RawMessage)
 		return "", EditDetails{}, fmt.Errorf("修改已取消: %w", err)
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return "", EditDetails{}, fmt.Errorf("定位文件写入位置失败: %w", err)
-	}
-	written, err := file.Write([]byte(updated))
-	if err != nil {
-		return "", EditDetails{}, fmt.Errorf("写回文件失败: %w", err)
-	}
-	if written != len(updated) {
-		return "", EditDetails{}, fmt.Errorf("写回文件失败: %w", io.ErrShortWrite)
-	}
-	if err := file.Truncate(int64(len(updated))); err != nil {
-		return "", EditDetails{}, fmt.Errorf("截断文件失败: %w", err)
+	if err := os.WriteFile(path, []byte(updated), info.Mode().Perm()); err != nil {
+		return "", EditDetails{}, pierrors.ErrToolRuntime.Wrap(fmt.Errorf("写回文件失败: %w", err))
 	}
 
 	details := EditDetails{
@@ -178,20 +162,6 @@ func (t *EditTool) executeWithDetails(ctx context.Context, args json.RawMessage)
 		FirstChangedLine: 1 + strings.Count(originalContent[:matches[0].match.start], "\n"),
 	}
 	return fmt.Sprintf("Applied %d edits to %s", len(matches), path), details, nil
-}
-
-func writeAll(writer io.Writer, content []byte) error {
-	for len(content) > 0 {
-		written, err := writer.Write(content)
-		if err != nil {
-			return err
-		}
-		if written == 0 {
-			return io.ErrShortWrite
-		}
-		content = content[written:]
-	}
-	return nil
 }
 
 type editArgs struct {

@@ -1,0 +1,429 @@
+// Package schema 定义与模型平台无关的消息、内容块、工具 Schema、用量与流事件
+// 表示，并负责到 OpenAI / Anthropic 两套协议的转换。本包不依赖 SDK 内任何
+// 其他包。文件划分：protocol.go 承载消息侧（消息、内容块、用量、事件），
+// tools.go 承载工具侧（工具 Schema 与调用参数）。
+package schema
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strings"
+
+	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
+	openaisdk "github.com/openai/openai-go/v3"
+)
+
+// Role 表示消息在大模型对话中的角色。
+type Role string
+
+const (
+	RoleSystem    Role = "system"    // RoleSystem 表示系统提示词。
+	RoleUser      Role = "user"      // RoleUser 表示用户输入。
+	RoleAssistant Role = "assistant" // RoleAssistant 表示模型输出。
+	RoleTool      Role = "tool"      // RoleTool 表示工具执行结果。
+)
+
+// FinishReason 表示模型结束当前响应的原因。
+type FinishReason string
+
+const (
+	FinishReasonStop    FinishReason = "stop"
+	FinishReasonToolUse FinishReason = "tool_use"
+	FinishReasonLength  FinishReason = "length"
+)
+
+// Message 表示对话上下文中传递的一条消息。
+type Message struct {
+	// Role 表示消息角色。
+	Role Role `json:"role"`
+	// Content 保存消息的内容块。
+	Content ContentBlocks `json:"content,omitempty"`
+	// Usage 保存生成当前模型消息时产生的用量信息。
+	Usage *Usage `json:"usage,omitempty"`
+	// FinishReason 保存模型结束当前响应的统一原因。
+	FinishReason FinishReason `json:"finish_reason,omitempty"`
+	// ToolCalls 保存模型请求执行的工具调用，允许同时包含多个调用。
+	ToolCalls ToolCalls `json:"tool_calls,omitempty"`
+	// ToolCallID 保存当前工具结果所对应的工具调用 ID。
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	// ToolName 保存当前工具结果所对应的工具名称。
+	ToolName string `json:"tool_name,omitempty"`
+	// IsError 表示当前工具结果是否为错误结果。
+	IsError bool `json:"is_error,omitempty"`
+}
+
+type Messages []*Message
+
+// Validate 校验整个消息序列：角色必须已知，tool 消息必须携带 ToolCallID，
+// 内容块必须合法且只允许 user 消息携带图片。Provider 在入口边界统一调用，
+// 非法输入在协议转换前拦截，避免落成平台侧的模糊错误。
+func (m Messages) Validate() error {
+	for _, message := range m {
+		switch message.Role {
+		case RoleSystem, RoleUser, RoleAssistant, RoleTool:
+		default:
+			return fmt.Errorf("unsupported message role %q", message.Role)
+		}
+		if message.Role == RoleTool && message.ToolCallID == "" {
+			return fmt.Errorf("tool message requires tool_call_id")
+		}
+		if err := message.Content.ValidateForRole(message.Role); err != nil {
+			return fmt.Errorf("message role %q: %w", message.Role, err)
+		}
+	}
+	return nil
+}
+
+func (m Messages) ToOpenAIMessages() ([]openaisdk.ChatCompletionMessageParamUnion, error) {
+	result := make([]openaisdk.ChatCompletionMessageParamUnion, 0, len(m))
+	for _, message := range m {
+		switch message.Role {
+		case RoleSystem:
+			text, err := message.Content.Text()
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, openaisdk.SystemMessage(text))
+		case RoleUser:
+			user, err := message.toOpenAIUserMessage()
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, user)
+		case RoleTool:
+			text, err := message.Content.Text()
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, openaisdk.ToolMessage(text, message.ToolCallID))
+		case RoleAssistant:
+			text, err := message.Content.Text()
+			if err != nil {
+				return nil, err
+			}
+			assistant := openaisdk.ChatCompletionAssistantMessageParam{}
+			if text != "" {
+				assistant.Content = openaisdk.ChatCompletionAssistantMessageParamContentUnion{OfString: openaisdk.String(text)}
+			}
+			for _, toolCall := range message.ToolCalls {
+				assistant.ToolCalls = append(assistant.ToolCalls, openaisdk.ChatCompletionMessageToolCallUnionParam{
+					OfFunction: &openaisdk.ChatCompletionMessageFunctionToolCallParam{
+						ID: toolCall.ID,
+						Function: openaisdk.ChatCompletionMessageFunctionToolCallFunctionParam{
+							Name: toolCall.Name, Arguments: string(toolCall.Arguments),
+						},
+					},
+				})
+			}
+			result = append(result, openaisdk.ChatCompletionMessageParamUnion{OfAssistant: &assistant})
+		}
+	}
+	return result, nil
+}
+
+func (m Messages) ToAnthropicMessages() ([]anthropicsdk.MessageParam, []anthropicsdk.TextBlockParam, error) {
+	result := make([]anthropicsdk.MessageParam, 0, len(m))
+	var system []anthropicsdk.TextBlockParam
+
+	for _, message := range m {
+		switch message.Role {
+		case RoleSystem:
+			text, err := message.Content.Text()
+			if err != nil {
+				return nil, nil, err
+			}
+			system = append(system, anthropicsdk.TextBlockParam{Text: text})
+		case RoleUser:
+			var blocks []anthropicsdk.ContentBlockParamUnion
+			for _, block := range message.Content {
+				switch block.Type {
+				case ContentTypeText:
+					blocks = append(blocks, anthropicsdk.NewTextBlock(block.Text))
+				case ContentTypeImage:
+					blocks = append(blocks, anthropicsdk.NewImageBlock(anthropicsdk.URLImageSourceParam{URL: block.Image.URL}))
+				}
+			}
+			result = append(result, anthropicsdk.NewUserMessage(blocks...))
+		case RoleTool:
+			text, err := message.Content.Text()
+			if err != nil {
+				return nil, nil, err
+			}
+			result = append(result, anthropicsdk.NewUserMessage(
+				anthropicsdk.NewToolResultBlock(message.ToolCallID, text, message.IsError),
+			))
+		case RoleAssistant:
+			text, err := message.Content.Text()
+			if err != nil {
+				return nil, nil, err
+			}
+			var blocks []anthropicsdk.ContentBlockParamUnion
+			if text != "" {
+				blocks = append(blocks, anthropicsdk.NewTextBlock(text))
+			}
+
+			for _, toolCall := range message.ToolCalls {
+				var input any
+				if err = json.Unmarshal(toolCall.Arguments, &input); err != nil {
+					return nil, nil, fmt.Errorf("tool call %q arguments: %w", toolCall.ID, err)
+				}
+				blocks = append(blocks, anthropicsdk.NewToolUseBlock(toolCall.ID, input, toolCall.Name))
+			}
+			result = append(result, anthropicsdk.NewAssistantMessage(blocks...))
+		}
+	}
+	return result, system, nil
+}
+
+// toOpenAIUserMessage 映射 user 消息
+func (m *Message) toOpenAIUserMessage() (openaisdk.ChatCompletionMessageParamUnion, error) {
+	hasImage := false
+	for _, block := range m.Content {
+		if block.Type == ContentTypeImage {
+			hasImage = true
+			break
+		}
+	}
+
+	if !hasImage {
+		text, err := m.Content.Text()
+		if err != nil {
+			return openaisdk.ChatCompletionMessageParamUnion{}, err
+		}
+		return openaisdk.UserMessage(text), nil
+	}
+
+	parts := make([]openaisdk.ChatCompletionContentPartUnionParam, 0, len(m.Content))
+	for _, block := range m.Content {
+		switch block.Type {
+		case ContentTypeText:
+			parts = append(parts, openaisdk.ChatCompletionContentPartUnionParam{
+				OfText: &openaisdk.ChatCompletionContentPartTextParam{Text: block.Text},
+			})
+		case ContentTypeImage:
+			parts = append(parts, openaisdk.ChatCompletionContentPartUnionParam{
+				OfImageURL: &openaisdk.ChatCompletionContentPartImageParam{
+					ImageURL: openaisdk.ChatCompletionContentPartImageImageURLParam{URL: block.Image.URL},
+				},
+			})
+		}
+	}
+
+	return openaisdk.UserMessage(parts), nil
+}
+
+// ContentType 表示消息内容块的类型。
+type ContentType string
+
+// ContentTypeText 表示纯文本内容块。
+const ContentTypeText ContentType = "text"
+
+// ContentTypeImage 表示 URL 图像内容块。
+const ContentTypeImage ContentType = "image"
+
+// ContentBlocks is an ordered collection of message content blocks.
+type ContentBlocks []ContentBlock
+
+// ContentBlock 表示消息中的一个内容块。联合类型取值受 Validate 约束：
+// text 块不得携带 Image，image 块只携带 Image 不携带 Text。
+type ContentBlock struct {
+	// Type 表示内容块的类型。
+	Type ContentType `json:"type"`
+	// Text 保存文本内容。
+	Text string `json:"text,omitempty"`
+	// Image 保存 URL 图像内容；仅 Type 为 ContentTypeImage 时非空。
+	Image *ImageContent `json:"image,omitempty"`
+}
+
+// ImageContent 表示一个 URL 图像内容。
+type ImageContent struct {
+	// URL 是图像的可访问地址；调用方必须保证推理服务商可访问且生命周期足够长。
+	URL string `json:"url"`
+}
+
+// TextBlock 创建一个纯文本内容块。
+func TextBlock(text string) ContentBlock {
+	return ContentBlock{Type: ContentTypeText, Text: text}
+}
+
+// ImageBlock 创建一个 URL 图像内容块。
+func ImageBlock(imageURL string) ContentBlock {
+	return ContentBlock{Type: ContentTypeImage, Image: &ImageContent{URL: imageURL}}
+}
+
+// Validate 校验内容块的联合类型取值：text 块不得携带 Image，image 块必须
+// 只携带合法 URL 的 Image，未知类型报错。校验集中在入口边界复用本函数，
+// 不散落到使用方。
+func (block ContentBlock) Validate() error {
+	switch block.Type {
+	case ContentTypeText:
+		if block.Image != nil {
+			return fmt.Errorf("text block must not carry an image")
+		}
+	case ContentTypeImage:
+		if block.Text != "" {
+			return fmt.Errorf("image block must not carry text")
+		}
+		if block.Image == nil {
+			return fmt.Errorf("image block requires image content")
+		}
+		if err := block.Image.Validate(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported content type %q", block.Type)
+	}
+	return nil
+}
+
+// Validate 校验图像内容的 URL：必须是带 host 的 http/https 地址。
+func (image ImageContent) Validate() error {
+	parsed, err := url.Parse(image.URL)
+	if err != nil {
+		return fmt.Errorf("image url %q: %w", image.URL, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("image url %q must use http or https", image.URL)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("image url %q requires a host", image.URL)
+	}
+	return nil
+}
+
+// ValidateForRole validates every block and enforces that only user messages
+// may contain images.
+func (blocks ContentBlocks) ValidateForRole(role Role) error {
+	for _, block := range blocks {
+		if err := block.Validate(); err != nil {
+			return err
+		}
+		if block.Type == ContentTypeImage && role != RoleUser {
+			return fmt.Errorf("role %q must not carry image blocks", role)
+		}
+	}
+	return nil
+}
+
+// Clone deep-copies the backing slice and Image pointers.
+func (blocks ContentBlocks) Clone() ContentBlocks {
+	if blocks == nil {
+		return nil
+	}
+	cloned := make(ContentBlocks, len(blocks))
+	for index, block := range blocks {
+		cloned[index] = block
+		if block.Image != nil {
+			image := *block.Image
+			cloned[index].Image = &image
+		}
+	}
+	return cloned
+}
+
+// WithImagePlaceholders returns a copy where image blocks are replaced by
+// redacted text placeholders.
+func (blocks ContentBlocks) WithImagePlaceholders() ContentBlocks {
+	result := make(ContentBlocks, 0, len(blocks))
+	for _, block := range blocks {
+		if block.Type == ContentTypeImage && block.Image != nil {
+			result = append(result, TextBlock(ImagePlaceholderText(block.Image.URL)))
+			continue
+		}
+		result = append(result, block)
+	}
+	return result
+}
+
+// ImagePlaceholderText 生成图像块的脱敏占位文本：只保留 scheme、host 与
+// path，剥离查询参数与片段，避免签名、临时 Token 泄漏到模型上下文。降级
+// 占位与压缩摘要投影共用本函数。
+func ImagePlaceholderText(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return "[图片]"
+	}
+	brief := parsed.Scheme + "://" + parsed.Host + parsed.Path
+	if parsed.Path == "" || parsed.Path == "/" {
+		brief = parsed.Scheme + "://" + parsed.Host
+	}
+	return "[图片: " + brief + "]"
+}
+
+// Text concatenates text blocks in order and rejects non-text content.
+func (blocks ContentBlocks) Text() (string, error) {
+	var builder strings.Builder
+	for _, block := range blocks {
+		if block.Type != ContentTypeText {
+			return "", fmt.Errorf("unsupported content type %q", block.Type)
+		}
+		builder.WriteString(block.Text)
+	}
+	return builder.String(), nil
+}
+
+// MaxUsageDecimalExclusive 是以 DECIMAL(20,12) 存储价格和单次调用成本时的上限，不包含该值本身。
+const MaxUsageDecimalExclusive = 100_000_000
+
+// CostQuality 是成本可信度枚举（设计 §9.1）。
+type CostQuality string
+
+const (
+	// CostQualityExact 表示 Provider 分项足以按配置价格重算成本。
+	CostQualityExact CostQuality = "exact"
+	// CostQualityEstimated 表示成本只能估算。
+	CostQualityEstimated CostQuality = "estimated"
+)
+
+// Usage 保存一次模型响应的标准化令牌用量、价格、成本和延迟数据。
+type Usage struct {
+	// InputTokens 是输入令牌数。
+	InputTokens int64 `json:"input_tokens"`
+	// OutputTokens 是输出令牌数。
+	OutputTokens int64 `json:"output_tokens"`
+	// InputPriceUSDPerMillionTokens 是每百万输入令牌的美元价格。
+	InputPriceUSDPerMillionTokens float64 `json:"input_price_usd_per_million_tokens"`
+	// OutputPriceUSDPerMillionTokens 是每百万输出令牌的美元价格。
+	OutputPriceUSDPerMillionTokens float64 `json:"output_price_usd_per_million_tokens"`
+	// CostUSD 是本次响应的美元成本。
+	CostUSD float64 `json:"cost_usd"`
+	// LatencyMS 是本次响应的延迟，单位为毫秒。
+	LatencyMS int64 `json:"latency_ms"`
+	// PlatformID 是提供模型服务的平台标识。
+	PlatformID string `json:"platform_id"`
+	// Model 是生成响应的模型名称。
+	Model string `json:"model"`
+	// TTFTMS 是首个非空 Text Delta 的延迟毫秒数；nil 表示未观测到
+	// Text Delta（如纯 Tool Call 响应），0 表示已观测但不足 1ms（设计 §9.1）。
+	TTFTMS *int64 `json:"ttft_ms,omitempty"`
+	// CostQuality 表示成本可信度（§9.1）：exact 表示分项足以按配置价格
+	// 重算；estimated 不能混入精确成本报表。缺省空值按 estimated 处理。
+	CostQuality CostQuality `json:"cost_quality,omitempty"`
+	// 是其子集；Output 是总输出，Reasoning 是其子集。
+	// CacheReadTokens 是缓存读取令牌数。
+	CacheReadTokens int64 `json:"cache_read_tokens,omitempty"`
+	// CacheWriteTokens 是缓存写入令牌数。
+	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
+	// ReasoningTokens 是推理令牌数。
+	ReasoningTokens int64 `json:"reasoning_tokens,omitempty"`
+	// CacheReadPriceUSDPerMillionTokens 是每百万缓存读取令牌的美元价格。
+	CacheReadPriceUSDPerMillionTokens float64 `json:"cache_read_price_usd_per_million_tokens,omitempty"`
+	// CacheWritePriceUSDPerMillionTokens 是每百万缓存写入令牌的美元价格。
+	CacheWritePriceUSDPerMillionTokens float64 `json:"cache_write_price_usd_per_million_tokens,omitempty"`
+}
+
+type StreamEventType string
+
+const (
+	StreamEventStart     StreamEventType = "start"
+	StreamEventTextDelta StreamEventType = "text_delta"
+	StreamEventDone      StreamEventType = "done"
+	StreamEventError     StreamEventType = "error"
+)
+
+// StreamEvent 是与具体模型 SDK 无关的模型响应事件。
+type StreamEvent struct {
+	Type      StreamEventType
+	TextDelta string
+}

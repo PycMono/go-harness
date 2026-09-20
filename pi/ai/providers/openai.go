@@ -8,7 +8,7 @@ import (
 
 	"github.com/PycMono/go-harness/pi/ai"
 	pierrors "github.com/PycMono/go-harness/pi/error"
-	"github.com/PycMono/go-harness/pi/tools"
+	"github.com/PycMono/go-harness/pi/schema"
 	openaisdk "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/respjson"
@@ -35,8 +35,8 @@ func NewOpenAI(opts *Options) ai.Provider {
 
 func (o *OpenAIImpl) Stream(
 	ctx context.Context,
-	msgs ai.Messages,
-	tools tools.ToolDefinitions,
+	msgs schema.Messages,
+	definitions schema.ToolDefinitions,
 ) ai.Stream {
 	if err := msgs.Validate(); err != nil {
 		return newFailedStream(pierrors.ErrAIGeneration.Wrap(fmt.Errorf("%s 消息校验失败: %w", o.name, err)))
@@ -47,7 +47,7 @@ func (o *OpenAIImpl) Stream(
 		return newFailedStream(pierrors.ErrAIGeneration.Wrap(fmt.Errorf("%s 消息转换失败: %w", o.name, err)))
 	}
 
-	openAITools, err := tools.ToOpenAITools()
+	openAITools, err := definitions.ToOpenAITools()
 	if err != nil {
 		return newFailedStream(pierrors.ErrAIGeneration.Wrap(fmt.Errorf("%s 工具定义转换失败: %w", o.name, err)))
 	}
@@ -94,7 +94,7 @@ type openAIStream struct {
 	provider    *OpenAIImpl
 	stream      *openaisstream.Stream[openaisdk.ChatCompletionChunk]
 	accumulator openaisdk.ChatCompletionAccumulator
-	pending     []ai.StreamEvent
+	pending     []schema.StreamEvent
 	usageSeen   bool
 }
 
@@ -126,8 +126,8 @@ func (s *openAIStream) Next() bool {
 		}
 		for _, choice := range chunk.Choices {
 			if choice.Delta.Content != "" {
-				s.pending = append(s.pending, ai.StreamEvent{
-					Type: ai.StreamEventTextDelta, TextDelta: choice.Delta.Content,
+				s.pending = append(s.pending, schema.StreamEvent{
+					Type: schema.StreamEventTextDelta, TextDelta: choice.Delta.Content,
 				})
 			}
 		}
@@ -162,18 +162,18 @@ func (s *openAIStream) finish() error {
 	}
 
 	message := response.Choices[0].Message
-	result := &ai.Message{
-		Role:         ai.RoleAssistant,
+	result := &schema.Message{
+		Role:         schema.RoleAssistant,
 		FinishReason: openAIFinishReason(response.Choices[0].FinishReason),
 	}
 	if message.Content != "" {
-		result.Content = []tools.ContentBlock{tools.TextBlock(message.Content)}
+		result.Content = []schema.ContentBlock{schema.TextBlock(message.Content)}
 	}
 	for _, toolCall := range message.ToolCalls {
 		if toolCall.Type != "function" {
 			continue
 		}
-		result.ToolCalls = append(result.ToolCalls, tools.ToolCall{
+		result.ToolCalls = append(result.ToolCalls, schema.ToolCall{
 			ID:        toolCall.ID,
 			Name:      toolCall.Function.Name,
 			Arguments: json.RawMessage(toolCall.Function.Arguments),
@@ -193,20 +193,20 @@ func (s *streamState) start() bool {
 	}
 
 	s.started = true
-	s.current = ai.StreamEvent{Type: ai.StreamEventStart}
+	s.current = schema.StreamEvent{Type: schema.StreamEventStart}
 	return true
 }
 
 func (s *streamState) fail(err error) bool {
 	s.err = err
 	s.terminal = true
-	s.current = ai.StreamEvent{Type: ai.StreamEventError}
+	s.current = schema.StreamEvent{Type: schema.StreamEventError}
 	return true
 }
 
 func (s *streamState) done() bool {
 	s.terminal = true
-	s.current = ai.StreamEvent{Type: ai.StreamEventDone}
+	s.current = schema.StreamEvent{Type: schema.StreamEventDone}
 	return true
 }
 
@@ -229,14 +229,14 @@ func toInt64(fields map[string]respjson.Field, name string) int64 {
 	return value
 }
 
-func openAIFinishReason(reason string) ai.FinishReason {
+func openAIFinishReason(reason string) schema.FinishReason {
 	switch reason {
 	case "tool_calls", "function_call":
-		return ai.FinishReasonToolUse
+		return schema.FinishReasonToolUse
 	case "length":
-		return ai.FinishReasonLength
+		return schema.FinishReasonLength
 	default:
-		return ai.FinishReasonStop
+		return schema.FinishReasonStop
 	}
 }
 
@@ -245,8 +245,8 @@ func openAIFinishReason(reason string) ai.FinishReason {
 // InputTokens = prompt_tokens。DeepSeek 的 prompt_cache_hit_tokens 是非标
 // 字段，经 ExtraFields 读取；其 prompt_tokens 本身即 hit + miss 总量。
 // 字段缺失时对应分项为 0，总量与分项必须一致由 §9.1 校验兜底。
-func mapOpenAIUsage(usage openaisdk.CompletionUsage) *ai.Usage {
-	mapped := &ai.Usage{
+func mapOpenAIUsage(usage openaisdk.CompletionUsage) *schema.Usage {
+	mapped := &schema.Usage{
 		InputTokens:  usage.PromptTokens,
 		OutputTokens: usage.CompletionTokens,
 	}

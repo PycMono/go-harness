@@ -8,7 +8,7 @@ import (
 
 	"github.com/PycMono/go-harness/pi/ai"
 	pierrors "github.com/PycMono/go-harness/pi/error"
-	"github.com/PycMono/go-harness/pi/tools"
+	"github.com/PycMono/go-harness/pi/schema"
 	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	anthropicstream "github.com/anthropics/anthropic-sdk-go/packages/ssestream"
@@ -34,8 +34,8 @@ func NewAnthropic(opts *Options) ai.Provider {
 
 func (p *AnthropicImpl) Stream(
 	ctx context.Context,
-	msgs ai.Messages,
-	availableTools tools.ToolDefinitions,
+	msgs schema.Messages,
+	availableTools schema.ToolDefinitions,
 ) ai.Stream {
 	if err := msgs.Validate(); err != nil {
 		return newFailedStream(pierrors.ErrAIGeneration.Wrap(fmt.Errorf("%s 消息校验失败: %w", p.name, err)))
@@ -89,7 +89,7 @@ func (s *anthropicStream) Next() bool {
 		switch current := event.AsAny().(type) {
 		case anthropicsdk.ContentBlockDeltaEvent:
 			if delta, ok := current.Delta.AsAny().(anthropicsdk.TextDelta); ok && delta.Text != "" {
-				s.current = ai.StreamEvent{Type: ai.StreamEventTextDelta, TextDelta: delta.Text}
+				s.current = schema.StreamEvent{Type: schema.StreamEventTextDelta, TextDelta: delta.Text}
 				return true
 			}
 		case anthropicsdk.MessageStopEvent:
@@ -123,13 +123,13 @@ func (s *anthropicStream) finish() error {
 		)
 	}
 
-	result := &ai.Message{Role: ai.RoleAssistant, FinishReason: anthropicFinishReason(s.message.StopReason)}
+	result := &schema.Message{Role: schema.RoleAssistant, FinishReason: anthropicFinishReason(s.message.StopReason)}
 	for _, block := range s.message.Content {
 		switch block.Type {
 		case "text":
-			result.Content = append(result.Content, tools.TextBlock(block.Text))
+			result.Content = append(result.Content, schema.TextBlock(block.Text))
 		case "tool_use":
-			result.ToolCalls = append(result.ToolCalls, tools.ToolCall{
+			result.ToolCalls = append(result.ToolCalls, schema.ToolCall{
 				ID:        block.ID,
 				Name:      block.Name,
 				Arguments: append(json.RawMessage(nil), block.Input...),
@@ -137,7 +137,7 @@ func (s *anthropicStream) finish() error {
 		}
 	}
 	usage := s.message.Usage
-	result.Usage = &ai.Usage{
+	result.Usage = &schema.Usage{
 		InputTokens:      usage.InputTokens + usage.CacheReadInputTokens + usage.CacheCreationInputTokens,
 		OutputTokens:     usage.OutputTokens,
 		CacheReadTokens:  usage.CacheReadInputTokens,
@@ -177,13 +177,13 @@ func (p *AnthropicImpl) classifyError(err error) error {
 	return code.Wrap(err)
 }
 
-func anthropicFinishReason(reason anthropicsdk.StopReason) ai.FinishReason {
+func anthropicFinishReason(reason anthropicsdk.StopReason) schema.FinishReason {
 	switch reason {
 	case anthropicsdk.StopReasonToolUse:
-		return ai.FinishReasonToolUse
+		return schema.FinishReasonToolUse
 	case anthropicsdk.StopReasonMaxTokens:
-		return ai.FinishReasonLength
+		return schema.FinishReasonLength
 	default:
-		return ai.FinishReasonStop
+		return schema.FinishReasonStop
 	}
 }

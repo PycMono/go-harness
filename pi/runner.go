@@ -5,9 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/PycMono/go-harness/pi/ai"
 	pierrors "github.com/PycMono/go-harness/pi/error"
-	"github.com/PycMono/go-harness/pi/tools"
+	"github.com/PycMono/go-harness/pi/schema"
 )
 
 // MaxImagesPerMessage 是单条消息允许附加的图片数量上限。每张图按固定
@@ -38,7 +37,7 @@ type Message struct {
 }
 
 // Message2AI 校验业务消息并转换为模型内部消息。
-func (message Message) Message2AI() (*ai.Message, error) {
+func (message Message) Message2AI() (*schema.Message, error) {
 	if message.ContentType != "text" {
 		return nil, pierrors.ErrRequestInvalid.Wrap(fmt.Errorf(
 			"message content type must be %q, got %q",
@@ -51,12 +50,12 @@ func (message Message) Message2AI() (*ai.Message, error) {
 			fmt.Errorf("message content must not be empty"))
 	}
 
-	var role ai.Role
+	var role schema.Role
 	switch message.SenderType {
 	case "customer":
-		role = ai.RoleUser
+		role = schema.RoleUser
 	case "ai":
-		role = ai.RoleAssistant
+		role = schema.RoleAssistant
 	default:
 		return nil, pierrors.ErrRequestInvalid.Wrap(fmt.Errorf(
 			"unsupported message sender type %q",
@@ -64,9 +63,9 @@ func (message Message) Message2AI() (*ai.Message, error) {
 		))
 	}
 
-	content := []tools.ContentBlock{tools.TextBlock(message.Content)}
+	content := []schema.ContentBlock{schema.TextBlock(message.Content)}
 	if len(message.ImageURLs) > 0 {
-		if role != ai.RoleUser {
+		if role != schema.RoleUser {
 			return nil, pierrors.ErrRequestInvalid.Wrap(
 				fmt.Errorf("only customer messages may attach images"))
 		}
@@ -76,14 +75,14 @@ func (message Message) Message2AI() (*ai.Message, error) {
 				MaxImagesPerMessage, len(message.ImageURLs)))
 		}
 		for _, imageURL := range message.ImageURLs {
-			block := tools.ImageBlock(imageURL)
+			block := schema.ImageBlock(imageURL)
 			if err := block.Validate(); err != nil {
 				return nil, pierrors.ErrRequestInvalid.Wrap(err)
 			}
 			content = append(content, block)
 		}
 	}
-	return &ai.Message{Role: role, Content: content}, nil
+	return &schema.Message{Role: role, Content: content}, nil
 }
 
 type RunInput struct {
@@ -103,6 +102,14 @@ type ContextBlock struct {
 }
 
 func (r *RunInput) Validate() error {
+	if r.Input == nil {
+		return pierrors.ErrRequestInvalid.Wrap(fmt.Errorf("run input message must not be nil"))
+	}
+	for index, message := range r.History {
+		if message == nil {
+			return pierrors.ErrRequestInvalid.Wrap(fmt.Errorf("history message %d must not be nil", index))
+		}
+	}
 	for index, block := range r.Context {
 		if strings.TrimSpace(block.Name) == "" {
 			return pierrors.ErrRequestInvalid.Wrap(fmt.Errorf("context block %d name must not be empty", index))
@@ -116,5 +123,38 @@ func (r *RunInput) Validate() error {
 }
 
 type RunOutput struct {
-	message ai.Messages
+	message schema.Messages
+}
+
+// Messages 返回本轮运行产生的完整消息序列：组装好的上下文、每一轮模型消息、
+// 以及每次工具调用的结果，按发生顺序排列。运行中途失败时序列同样有效，只到
+// 出错前为止。
+func (r *RunOutput) Messages() schema.Messages {
+	return r.message
+}
+
+// Message 返回本轮最后一条模型消息，即面向调用方的最终答复；模型一次都没
+// 有输出时返回 nil。
+func (r *RunOutput) Message() *schema.Message {
+	for index := len(r.message) - 1; index >= 0; index-- {
+		if r.message[index].Role == schema.RoleAssistant {
+			return r.message[index]
+		}
+	}
+
+	return nil
+}
+
+// Text 返回最终答复的纯文本内容；没有模型消息或内容为空时返回空字符串。
+func (r *RunOutput) Text() string {
+	message := r.Message()
+	if message == nil {
+		return ""
+	}
+	text, err := message.Content.Text()
+	if err != nil {
+		return ""
+	}
+
+	return text
 }

@@ -1,18 +1,21 @@
 package providers
 
-import "github.com/PycMono/go-harness/pi/ai"
+import (
+	"github.com/PycMono/go-harness/pi/ai"
+	"github.com/PycMono/go-harness/pi/schema"
+)
 
 type streamState struct {
-	current  ai.StreamEvent
+	current  schema.StreamEvent
 	started  bool
 	terminal bool
-	result   *ai.Message
+	result   *schema.Message
 	err      error
 }
 
-func (s *streamState) Current() ai.StreamEvent { return s.current }
+func (s *streamState) Current() schema.StreamEvent { return s.current }
 
-func (s *streamState) Result() (*ai.Message, error) { return s.result, s.err }
+func (s *streamState) Result() (*schema.Message, error) { return s.result, s.err }
 
 type failedStream struct {
 	streamState

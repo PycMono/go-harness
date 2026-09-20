@@ -9,7 +9,7 @@ import (
 
 	"github.com/PycMono/go-harness/pi/ai"
 	"github.com/PycMono/go-harness/pi/ai/providers"
-	"github.com/PycMono/go-harness/pi/tools"
+	"github.com/PycMono/go-harness/pi/schema"
 )
 
 // harnessConfig 对应仓库根目录的 config.json，平台条目直接映射为 Options。
@@ -43,19 +43,19 @@ func buildProvider(opts *providers.Options) ai.Provider {
 }
 
 // consumeStream 消费整个流并打印事件，返回 Result。
-func consumeStream(stream ai.Stream) (*ai.Message, error) {
+func consumeStream(stream ai.Stream) (*schema.Message, error) {
 	defer stream.Close()
 
 	for stream.Next() {
 		event := stream.Current()
 		switch event.Type {
-		case ai.StreamEventStart:
+		case schema.StreamEventStart:
 			fmt.Println("[event] start")
-		case ai.StreamEventTextDelta:
+		case schema.StreamEventTextDelta:
 			fmt.Printf("[event] text_delta: %q\n", event.TextDelta)
-		case ai.StreamEventDone:
+		case schema.StreamEventDone:
 			fmt.Println("[event] done")
-		case ai.StreamEventError:
+		case schema.StreamEventError:
 			fmt.Println("[event] error")
 		}
 	}
@@ -90,9 +90,9 @@ func main() {
 	defer cancel()
 
 	fmt.Printf("=== %s (%s / %s) 流式响应 ===\n", opts.ID, opts.Protocol, opts.Model)
-	message, err := consumeStream(provider.Stream(ctx, ai.Messages{
-		{Role: ai.RoleSystem, Content: tools.ContentBlocks{tools.TextBlock("你是一个简洁的测试助手。")}},
-		{Role: ai.RoleUser, Content: tools.ContentBlocks{tools.TextBlock("用一句话介绍 Go 语言。")}},
+	message, err := consumeStream(provider.Stream(ctx, schema.Messages{
+		{Role: schema.RoleSystem, Content: schema.ContentBlocks{schema.TextBlock("你是一个简洁的测试助手。")}},
+		{Role: schema.RoleUser, Content: schema.ContentBlocks{schema.TextBlock("用一句话介绍 Go 语言。")}},
 	}, nil))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s 调用失败: %v\n", opts.ID, err)

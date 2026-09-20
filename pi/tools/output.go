@@ -1,203 +1,68 @@
 package tools
 
 import (
-	"encoding/json"
-	"errors"
-	"fmt"
+	"strings"
+	"unicode/utf8"
 
-	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
-	openaisdk "github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/shared"
+	"github.com/PycMono/go-harness/pi/schema"
 )
 
-// ToolCall 表示模型发起的一次工具调用请求。
-type ToolCall struct {
-	// ID 是工具调用的唯一标识。
-	ID string `json:"id"`
-	// Name 是模型请求调用的工具名称。
-	Name string `json:"name"`
-	// Arguments 保存未经解析的 JSON 参数，由具体工具负责解析。
-	Arguments json.RawMessage `json:"arguments"`
-}
+// UpdateEmitter receives incremental updates from a running tool.
+type UpdateEmitter func(schema.ToolUpdate)
 
-// ToolCalls 是一次响应中的一批工具调用请求。
-type ToolCalls []ToolCall
-
-// ToolDefinition 描述一个可供模型调用的工具。
-type ToolDefinition struct {
-	// Name 是工具的唯一名称。
-	Name string `json:"name"`
-	// Label 是用于展示的工具名称。
-	Label string `json:"label,omitempty"`
-	// Description 说明工具的用途。
-	Description string `json:"description"`
-	// InputSchema 使用 JSON Schema 描述工具的输入参数。
-	InputSchema any `json:"input_schema"`
-	// ParallelSafe 表示运行框架能否在同一批次中并发执行该工具，默认值为 false。
-	ParallelSafe bool `json:"parallel_safe,omitempty"`
-}
-
-// InputSchemaObject returns the tool input schema as a JSON object while
-func (t *ToolDefinition) InputSchemaObject() (map[string]any, error) {
-	wrap := func(err error) (map[string]any, error) {
-		return nil, fmt.Errorf("tool %q input schema: %w", t.Name, err)
+// LimitText 返回文本总量不超过 maxBytes 的 ToolOutput 副本。非文本块不
+// 占用额度；发生截断时保证 UTF-8 完整，并追加固定提示及 truncated 详情。
+// maxBytes 小于零时按零处理。截断提示本身不计入 maxBytes。
+func LimitText(output schema.ToolOutput, maxBytes int) schema.ToolOutput {
+	if maxBytes < 0 {
+		maxBytes = 0
 	}
 
-	value := t.InputSchema
-	if value == nil {
-		return nil, nil
+	remaining := maxBytes
+	limited := make(schema.ContentBlocks, 0, len(output.Content)+1)
+	truncated := false
+	for _, block := range output.Content {
+		if block.Type != schema.ContentTypeText {
+			limited = append(limited, block)
+			continue
+		}
+
+		text := strings.ToValidUTF8(block.Text, "�")
+		if len(text) <= remaining {
+			block.Text = text
+			limited = append(limited, block)
+			remaining -= len(text)
+			continue
+		}
+		cut := remaining
+		for cut > 0 && !utf8.ValidString(text[:cut]) {
+			cut--
+		}
+
+		block.Text = text[:cut]
+		limited = append(limited, block, schema.TextBlock(toolOutputTruncationMarker))
+		truncated = true
+		break
 	}
 
-	object, ok := value.(map[string]any)
-	if !ok {
-		encoded, err := json.Marshal(value)
-		if err != nil {
-			return wrap(err)
-		}
-		if err = json.Unmarshal(encoded, &object); err != nil {
-			return wrap(err)
-		}
-		if object == nil {
-			return wrap(errors.New("JSON schema must be an object"))
-		}
+	output.Content = limited
+	if !truncated {
+		return output
 	}
 
-	normalized, err := normalizeToolSchemaNumbers(object)
-	if err != nil {
-		return wrap(err)
-	}
-	object = normalized.(map[string]any)
-	if schemaType, exists := object["type"]; exists && schemaType != "object" {
-		return nil, fmt.Errorf("tool %q input schema type must be object", t.Name)
-	}
-
-	return object, nil
-}
-
-type ToolDefinitions []*ToolDefinition
-
-func (t ToolDefinitions) ToOpenAITools() ([]openaisdk.ChatCompletionToolUnionParam, error) {
-	result := make([]openaisdk.ChatCompletionToolUnionParam, 0, len(t))
-	for _, definition := range t {
-		inputSchema, err := definition.InputSchemaObject()
-		if err != nil {
-			return nil, err
-		}
-
-		result = append(result, openaisdk.ChatCompletionFunctionTool(shared.FunctionDefinitionParam{
-			Name: definition.Name, Description: openaisdk.String(definition.Description), Parameters: inputSchema,
-		}))
-	}
-
-	return result, nil
-}
-
-func (t ToolDefinitions) ToAnthropicTools() ([]anthropicsdk.ToolUnionParam, error) {
-	result := make([]anthropicsdk.ToolUnionParam, 0, len(t))
-	for _, definition := range t {
-		inputSchema, err := definition.InputSchemaObject()
-		if err != nil {
-			return nil, err
-		}
-		var properties any
-		var required []string
-		extraFields := make(map[string]any)
-		for key, value := range inputSchema {
-			switch key {
-			case "type":
-			case "properties":
-				properties = value
-			case "required":
-				required, err = schemaStringValues(value)
-				if err != nil {
-					return nil, fmt.Errorf("tool %q required: %w", definition.Name, err)
-				}
-			default:
-				extraFields[key] = value
-			}
-		}
-		tool := anthropicsdk.ToolParam{
-			Name: definition.Name, Description: anthropicsdk.String(definition.Description),
-			InputSchema: anthropicsdk.ToolInputSchemaParam{Properties: properties, Required: required, ExtraFields: extraFields},
-		}
-		result = append(result, anthropicsdk.ToolUnionParam{OfTool: &tool})
-	}
-	return result, nil
-}
-
-// Has 报告是否存在指定名称的工具定义。
-func (t ToolDefinitions) Has(name string) bool {
-	for _, definition := range t {
-		if definition.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-// ParallelSafety 返回每个工具名称对应的并发安全标记快照。
-func (t ToolDefinitions) ParallelSafety() map[string]bool {
-	parallelSafes := make(map[string]bool, len(t))
-	for _, definition := range t {
-		parallelSafes[definition.Name] = definition.ParallelSafe
-	}
-
-	return parallelSafes
-}
-
-func normalizeToolSchemaNumbers(value any) (any, error) {
-	switch typed := value.(type) {
-	case json.Number:
-		if integer, err := typed.Int64(); err == nil {
-			return integer, nil
-		}
-		number, err := typed.Float64()
-		if err != nil {
-			return nil, fmt.Errorf("invalid JSON schema number %q: %w", typed, err)
-		}
-		return number, nil
+	switch details := output.Details.(type) {
 	case map[string]any:
-		result := make(map[string]any, len(typed))
-		for key, child := range typed {
-			normalized, err := normalizeToolSchemaNumbers(child)
-			if err != nil {
-				return nil, err
-			}
-			result[key] = normalized
+		cloned := make(map[string]any, len(details)+1)
+		for key, value := range details {
+			cloned[key] = value
 		}
-		return result, nil
-	case []any:
-		result := make([]any, len(typed))
-		for index, child := range typed {
-			normalized, err := normalizeToolSchemaNumbers(child)
-			if err != nil {
-				return nil, err
-			}
-			result[index] = normalized
-		}
-		return result, nil
-	default:
-		return value, nil
-	}
-}
-
-func schemaStringValues(value any) ([]string, error) {
-	switch values := value.(type) {
+		cloned["truncated"] = true
+		output.Details = cloned
 	case nil:
-		return nil, nil
-	case []string:
-		return values, nil
-	case []any:
-		result := make([]string, 0, len(values))
-		for _, value := range values {
-			text, ok := value.(string)
-			if !ok {
-				return nil, errors.New("must contain only strings")
-			}
-			result = append(result, text)
-		}
-		return result, nil
+		output.Details = map[string]any{"truncated": true}
 	default:
-		return nil, errors.New("must be an array of strings")
+		output.Details = map[string]any{"tool_details": details, "truncated": true}
 	}
+
+	return output
 }

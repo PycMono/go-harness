@@ -5,14 +5,18 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/PycMono/go-harness/pi/ai"
-	"github.com/PycMono/go-harness/pi/tools"
+	"github.com/PycMono/go-harness/pi/resources"
+	"github.com/PycMono/go-harness/pi/schema"
 )
 
-// Context 模型上下文信息
+/*
+	模型上下文管理
+*/
+
+// Context 模型上下文管理
 type Context struct {
-	Messages ai.Messages
-	Tools    tools.ToolDefinitions
+	Messages schema.Messages
+	Tools    schema.ToolDefinitions
 	Context  []*ContextBlock
 	// 供压缩识别本次真实用户输入
 	CurrentInputIndex int
@@ -29,25 +33,35 @@ func NewContextBuilder(workDir string) *ContextBuilder {
 // Build 构建上下文
 func (c *ContextBuilder) Build(
 	ctx context.Context,
-	history ai.Messages,
-	input *ai.Message,
+	history schema.Messages,
+	input *schema.Message,
 	contextBlocks []*ContextBlock,
-	definitions tools.ToolDefinitions) (*Context, error) {
-	// todo 加载技能
+	definitions schema.ToolDefinitions) (*Context, error) {
+	// 加载 agent 和技能
+	loader, err := resources.Load(ctx, c.workDir)
+	if err != nil {
+		return nil, err
+	}
+	sysPrompt := loader.SystemPrompt() // 加载 agent 和技能
+	systemMessage := &schema.Message{
+		Role:    schema.RoleSystem,
+		Content: []schema.ContentBlock{schema.TextBlock(sysPrompt)},
+	}
 
 	// 处理消息
-	messages := make([]*ai.Message, 0, 2+len(contextBlocks)+len(history))
-	messages = append(messages, append([]*ai.Message(nil), history...)...)
+	messages := make([]*schema.Message, 0, 2+len(contextBlocks)+len(history))
+	messages = append(messages, append([]*schema.Message(nil), history...)...)
 	messages = append(messages, input)
+	messages = append(messages, systemMessage)
 
 	blocks := append([]*ContextBlock(nil), contextBlocks...)
 	sort.SliceStable(contextBlocks, func(i, j int) bool {
 		return contextBlocks[i].Priority > contextBlocks[j].Priority
 	})
 	for _, block := range blocks {
-		messages = append(messages, &ai.Message{
-			Role: ai.RoleSystem,
-			Content: []tools.ContentBlock{tools.TextBlock(
+		messages = append(messages, &schema.Message{
+			Role: schema.RoleSystem,
+			Content: []schema.ContentBlock{schema.TextBlock(
 				"# Context: " + strings.TrimSpace(block.Name) + "\n" + block.Content,
 			)},
 		})
@@ -55,7 +69,7 @@ func (c *ContextBuilder) Build(
 
 	return &Context{
 		Messages:          messages,
-		Tools:             append(tools.ToolDefinitions(nil), definitions...),
+		Tools:             append(schema.ToolDefinitions(nil), definitions...),
 		CurrentInputIndex: len(messages) - 1,
 	}, nil
 }

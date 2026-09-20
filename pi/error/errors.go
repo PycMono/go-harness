@@ -92,6 +92,11 @@ var (
 	ErrToolTimeout          = New(30006, "工具执行超时")
 	ErrToolPanic            = New(30007, "工具执行异常")
 
+	// 工具注册与定义
+	ErrToolDefinitionInvalid = New(30008, "工具定义无效")
+	ErrToolAlreadyRegistered = New(30009, "工具已注册")
+	ErrToolRegistryFrozen    = New(30010, "工具注册表已冻结")
+
 	// ErrCanceled 取消与超时
 	ErrCanceled         = New(40000, "已取消")
 	ErrDeadlineExceeded = New(40001, "已超时")
@@ -102,6 +107,33 @@ var (
 
 	// ErrClosed 生命周期
 	ErrClosed = New(60000, "Agent 已关闭")
+
+	// Skill 诊断（70000–70099）：仅进入 Skill Diagnostic 与日志，
+	ErrSkillFileUnreadable          = New(70001, "SKILL.md 无法检查或读取")
+	ErrSkillFileTooLarge            = New(70002, "SKILL.md 超过 256 KiB")
+	ErrSkillFrontMatterMissing      = New(70003, "SKILL.md 缺少首行 FrontMatter")
+	ErrSkillFrontMatterUnclosed     = New(70004, "SKILL.md FrontMatter 未闭合")
+	ErrSkillFrontMatterInvalid      = New(70005, "SKILL.md FrontMatter YAML 无效")
+	ErrSkillFrontMatterControlChars = New(70006, "SKILL.md FrontMatter 包含非法控制字符")
+	ErrSkillNameMissing             = New(70007, "Skill name 不能为空")
+	ErrSkillNameInvalid             = New(70008, "Skill name 格式无效")
+	ErrSkillDescriptionMissing      = New(70009, "Skill description 不能为空")
+	ErrSkillDescriptionTooLong      = New(70010, "Skill description 超过 1024 个字符")
+	ErrSkillBodyEmpty               = New(70011, "Skill Body 不能为空")
+	ErrSkillBinaryContent           = New(70012, "SKILL.md 包含 NUL 字节")
+	ErrSkillNotUTF8                 = New(70013, "SKILL.md 不是有效的 UTF-8 文本")
+	ErrSkillDuplicateName           = New(70014, "同一来源存在重复 Skill name")
+	ErrSkillShadowed                = New(70015, "Skill 被更高优先级来源覆盖")
+	ErrSkillModelInvocationDisabled = New(70016, "Skill 已禁止模型调用")
+
+	ErrWorkDirRequired      = New(10004, "workDir 不能为空")
+	ErrWorkDirUnopenable    = New(10005, "工作区目录无法打开")
+	ErrAgentsFileMissing    = New(10006, "AGENTS.md 不存在")
+	ErrAgentsFileUnreadable = New(10007, "AGENTS.md 读取失败")
+	ErrAgentsFileNotRegular = New(10008, "AGENTS.md 不是普通文件")
+	ErrAgentsFileTooLarge   = New(10009, "AGENTS.md 超过 1 MiB")
+	ErrAgentsFileNotUTF8    = New(10010, "AGENTS.md 不是有效的 UTF-8 文本")
+	ErrAgentsFileEmpty      = New(10011, "AGENTS.md 不能为空")
 
 	// ErrInternal 内部
 	ErrInternal = New(90000, "内部错误")

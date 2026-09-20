@@ -1,0 +1,26 @@
+{
+  "currentPlatform": "deepseek",
+  "platforms": [
+    {
+      "id": "deepseek",
+      "protocol": "openai",
+      "baseURL": "https://api.deepseek.com/v1/",
+      "apiKey": "你的 Key",
+      "model": "deepseek-chat"
+    },
+    {
+      "id": "zhipu-openai",
+      "protocol": "openai",
+      "baseURL": "https://open.bigmodel.cn/api/paas/v4/",
+      "apiKey": "你的 Key",
+      "model": "glm-4.5-air"
+    },
+    {
+      "id": "zhipu-claude",
+      "protocol": "anthropic",
+      "baseURL": "https://open.bigmodel.cn/api/anthropic/",
+      "apiKey": "你的 Key",
+      "model": "glm-4.5-air"
+    }
+  ]
+}
