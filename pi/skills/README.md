@@ -7,4 +7,4 @@ SKILL.md 的发现、解析与 Prompt 渲染。
 - 快照（snapshot）：每次 Run 重新读取，保证技能内容随工作区实时变化。
 - Prompt 渲染（prompt/xml_text）：把技能概要渲染进 System Prompt，正文在工具调用时按需加载。
 
-本包不决定何时调用技能，只提供技能素材；组装归 `pi/context`。
+本包不决定何时调用技能，只提供技能素材；组装归 `pi`（`prompt.go`）。

@@ -5,7 +5,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/PycMono/go-harness/pi/resources"
 	"github.com/PycMono/go-harness/pi/schema"
 )
 
@@ -37,12 +36,11 @@ func (c *ContextBuilder) Build(
 	input *schema.Message,
 	contextBlocks []*ContextBlock,
 	definitions schema.ToolDefinitions) (*Context, error) {
-	// 加载 agent 和技能
-	loader, err := resources.Load(ctx, c.workDir)
+	// 组装系统提示词（核心纪律 + 技能目录 + AGENTS.md，细节见 prompt.go）
+	sysPrompt, err := SystemPrompt(ctx, c.workDir)
 	if err != nil {
 		return nil, err
 	}
-	sysPrompt := loader.SystemPrompt() // 加载 agent 和技能
 	systemMessage := &schema.Message{
 		Role:    schema.RoleSystem,
 		Content: []schema.ContentBlock{schema.TextBlock(sysPrompt)},

@@ -1,4 +1,4 @@
-package resources
+package pi
 
 import (
 	"bytes"
@@ -12,11 +12,13 @@ import (
 	"unicode/utf8"
 
 	pierrors "github.com/PycMono/go-harness/pi/error"
-	"github.com/PycMono/go-harness/pi/resources/skills"
+	"github.com/PycMono/go-harness/pi/skills"
 )
 
+// maxAgentsFileBytes 是 AGENTS.md 的大小上限。
 const maxAgentsFileBytes = 1024 * 1024
 
+// corePrompt 是注入每轮会话的运行时核心纪律。
 const corePrompt = `# Agent Runtime 核心纪律
 
 1. 必须遵守工作区 AGENTS.md 中定义的身份、职责和行为边界。
@@ -28,68 +30,51 @@ const corePrompt = `# Agent Runtime 核心纪律
 `
 
 /*
-	资源加载管理
-	1、加载 agents
-	2、加载 skills
+	系统提示词组装
+	1、读取校验工作区 AGENTS.md
+	2、发现技能并渲染技能目录
+	3、核心纪律 + 技能目录 + AGENTS.md 拼装
 */
 
-// Loader 资源加载管理
-type Loader struct {
-	agents []byte
-	skills *skills.Snapshot
-}
-
-// Load 读取工作区的 AGENTS.md 内容并发现 Skill 快照。
-func Load(ctx context.Context, workDir string) (*Loader, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	if strings.TrimSpace(workDir) == "" {
-		return nil, pierrors.ErrWorkspaceInvalid.Wrap(fmt.Errorf("workDir is required"))
-	}
-
-	// 先加载agent
+// SystemPrompt 把核心纪律、技能目录和工作区 AGENTS.md 组装成完整的系统提示词。
+// 每轮 Run 重新读取，保证技能与 AGENTS.md 内容随工作区实时变化；也可离线调用
+// 以检查组装结果。
+func SystemPrompt(ctx context.Context, workDir string) (string, error) {
+	// 先读取 AGENTS.md
 	agents, err := loadAgents(workDir)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return "", err
 	}
 
-	// 再加载 skill
+	// 再发现技能
 	snapshot, err := skills.Discover(workDir)
 	if err != nil {
-		return nil, pierrors.ErrWorkspaceInvalid.Wrap(fmt.Errorf("发现 Agent Skills 失败: %w", err))
+		return "", pierrors.ErrWorkspaceInvalid.Wrap(fmt.Errorf("发现 Agent Skills 失败: %w", err))
 	}
-	if err = ctx.Err(); err != nil {
-		return nil, err
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
-	return &Loader{agents: agents, skills: snapshot}, nil
-}
-
-// SystemPrompt 核心指令、技能目录和工作区 AGENTS.md 组装成完整的系统提示词。
-func (s Loader) SystemPrompt() string {
 	var builder strings.Builder
 	builder.WriteString(corePrompt)
 
-	skillPrompt := s.skills.Render()
-	if skillPrompt != "" {
+	if skillPrompt := snapshot.Render(); skillPrompt != "" {
 		builder.WriteString("\n")
 		builder.WriteString(skillPrompt)
 	}
 
 	// 组装 agent
 	builder.WriteString("\n# Agent 定义（来自 AGENTS.md）\n\n")
-	builder.Write(s.agents)
+	builder.Write(agents)
 	builder.WriteString("\n")
 
-	return builder.String()
+	return builder.String(), nil
 }
 
-// 打开工作区并读取 AGENTS.md：
+// loadAgents 打开工作区并读取 AGENTS.md：
 // 必须是工作区根下的普通文件、不超过 1 MiB、有效 UTF-8 且非空白。
 // 每个失败点对应 pi/errors 的具体哨兵码；OS 错误以哨兵 Wrap 挂原因链。
 func loadAgents(workDir string) ([]byte, error) {

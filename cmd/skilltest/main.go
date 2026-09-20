@@ -12,13 +12,12 @@ import (
 
 	"github.com/PycMono/go-harness/pi"
 	"github.com/PycMono/go-harness/pi/ai/providers"
-	"github.com/PycMono/go-harness/pi/resources"
 	"github.com/PycMono/go-harness/pi/schema"
 	"github.com/PycMono/go-harness/pi/tools"
 )
 
-// skilltest 用来验证资源加载（AGENTS.md + Agent Skills）和 loop 的串联：
-// 先离线调用 resources.Load 打印发现的技能和组装后的系统提示词，
+// skilltest 用来验证系统提示词组装（AGENTS.md + Agent Skills）和 loop 的串联：
+// 先离线调用 pi.SystemPrompt 打印组装后的系统提示词，
 // 再（除非 -check-only）像 cmd/harness 一样跑一轮完整的模型循环。
 
 // platformConfig 对应仓库根目录的 config.json，与 cmd/harness 的格式一致。
@@ -75,7 +74,7 @@ func main() {
 	prompt := flag.String("prompt",
 		"查看有哪些可用技能。如果存在与「打个招呼」相关的技能，先用 read 完整读取它的 SKILL.md，再按技能内容执行。",
 		"交给 agent 的任务")
-	checkOnly := flag.Bool("check-only", false, "只验证资源加载并打印系统提示词，不调用模型")
+	checkOnly := flag.Bool("check-only", false, "只组装并打印系统提示词，不调用模型")
 	maxParallel := flag.Int("max-parallel", 4, "同一批工具调用的并发上限")
 	maxTurns := flag.Int("max-turns", 0, "单次运行的模型调用次数上限，0 表示用默认值")
 	timeout := flag.Duration("timeout", 5*time.Minute, "整轮运行的超时时间")
@@ -89,12 +88,12 @@ func main() {
 		fail(fmt.Errorf("解析工作目录失败: %w", err))
 	}
 
-	// 第一阶段：直接调用 resources.Load，验证 AGENTS.md 与 Skill 发现。
-	loader, err := resources.Load(ctx, root)
+	// 第一阶段：直接调用 pi.SystemPrompt，验证 AGENTS.md 与 Skill 发现。
+	sysPrompt, err := pi.SystemPrompt(ctx, root)
 	if err != nil {
-		fail(fmt.Errorf("资源加载失败（工作区需包含 AGENTS.md，技能放在 skills/ 等约定目录下）: %w", err))
+		fail(fmt.Errorf("系统提示词组装失败（工作区需包含 AGENTS.md，技能放在 skills/ 等约定目录下）: %w", err))
 	}
-	printResources(root, loader)
+	printSystemPrompt(root, sysPrompt)
 
 	if *checkOnly {
 		return
@@ -141,11 +140,9 @@ func main() {
 	fmt.Printf("\n=== 最终答复 ===\n%s\n", output.Text())
 }
 
-// printResources 打印加载到的 AGENTS.md 与技能快照，并导出最终系统提示词供人工检查。
-func printResources(root string, loader *resources.Loader) {
-	prompt := loader.SystemPrompt()
-
-	fmt.Printf("=== 资源加载检查 ===\n")
+// printSystemPrompt 打印组装后的系统提示词供人工检查。
+func printSystemPrompt(root, prompt string) {
+	fmt.Printf("=== 系统提示词检查 ===\n")
 	fmt.Printf("workdir: %s\n", root)
 	fmt.Printf("系统提示词总长度: %d 字符\n", len([]rune(prompt)))
 
