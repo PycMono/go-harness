@@ -9,7 +9,7 @@ const (
 )
 
 // sessionVersion 是会话文件格式版本，写在 header 里。
-const sessionVersion = 1
+const sessionVersion = 2
 
 // sessionIDPrefix 是 NewSessionID 生成的会话 id 的前缀。会话 id 直接当文件名
 // （<会话 id>.jsonl），所以这个前缀也决定了自动生成的会话文件长什么样：

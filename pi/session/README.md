@@ -89,7 +89,7 @@ type Entry struct {
 	Timestamp string        `json:"timestamp"`
 
 	Header  *Header         `json:"header,omitempty"`  // EntryHeader
-	Message *schema.Message `json:"message,omitempty"` // EntryMessage
+	Message schema.Message `json:"message,omitempty"` // EntryMessage
 }
 
 // Header 是会话首行。
@@ -106,7 +106,7 @@ type Header struct {
 
 `ParentID` 在 Phase 1 全部串成线性（每条指向上一条），但字段一次到位——pi 也是 v2 迁移才补的树，这里一次到位避免将来的格式迁移。压缩不在这份格式里：`compaction` entry、`Compaction` 结构体与读侧折叠随压缩功能一起去掉了（`Entry` 只有 `Header` 与 `Message` 两个载荷），做压缩时一起加回。
 
-`Header` 的名字与 pi.dev 一致（`SessionHeader`，session-manager.ts:40），字段逐项对应：`cwd` ↔ `WorkDir`、`timestamp` ↔ `CreatedAt`、`parentSession` ↔ `ParentSession`。两处层级差别：一是首行与 entry 的关系——pi.dev 分成 `FileEntry = SessionHeader | SessionEntry` 两条分支，我们用 `Entry.Header` 这个可空指针承载（Go 没有 union，tag + 可空载荷是等价写法，第 9 条）；二是字段的兑现程度——pi.dev 的 `version`（已到 3）和 `parentSession` 都真在读写，我们这边 `Version` 没有任何地方校验、`ParentSession` 恒空。后一条是账：留着是因为改动格式的成本随文件数增长，等会话列表/格式迁移真需要时再兑现，或者届时按"无读者即删"裁掉。字段值与行为无关这件事也写进了 `Entry.validate` 的注释——它只查"载荷在不在"，不看载荷里的值。
+`Header` 的名字与 pi.dev 一致（`SessionHeader`，session-manager.ts:40），字段逐项对应：`cwd` ↔ `WorkDir`、`timestamp` ↔ `CreatedAt`、`parentSession` ↔ `ParentSession`。当前消息载荷使用 `schema.Message` 四元联合接口，Entry 通过自定义 JSON 解码按 `role` 恢复具体消息类型；Session 文件版本为 2，读取时严格校验版本，旧版本需要显式迁移。
 
 `Entry` 之外有一个集合类型 `type Entries []Entry`，代表"一次会话的 entry 快照"。重建上下文和它用到的全部查找都落在这个集合上（见"上下文重建"），接收者恒定、方法不修改自身，仍然是纯函数，可以拿快照离线单测。`Manager.entries` / `Manager.Entries()` / `sessionFile.load` 都用它，不出现裸的 `[]Entry`。
 
@@ -228,7 +228,7 @@ Session *session.Manager
 ```go
 // WithMessageObserver 接收循环逐条产生的模型消息与工具结果消息；
 // 不设置时行为不变。与 TextObserver 一样在单线程控制流中同步调用。
-func WithMessageObserver(observer func(*schema.Message)) LoopOption
+func WithMessageObserver(observer func(schema.Message)) LoopOption
 ```
 
 Agent 接上 `session.Append`；Run 出错时已产生的 entry 保留（崩溃安全语义：恢复后从最后一次成功写入处继续）。写入失败没有从回调返回错误的通道，所以先攒在 `Agent.writeErr` 上，等 `loop.run` 返回后由 `Run` 透出——否则会出现"消息已经发给模型了、盘上没有"这种最隐蔽的缺段。缓冲落在 Agent 而不是 Run 的局部变量上，是因为循环在构造期建一次、观察者挂死在上面；`Run` 开头把它清零，一个 Run 一轮账。
@@ -239,7 +239,7 @@ Agent 接上 `session.Append`；Run 出错时已产生的 entry 保留（崩溃�
 
 `RunInput.History` 删除：history 只认会话这一个来源，调用方不再有第二个入口。原来那条互斥校验与 `ErrSessionHistoryConflict`(80003) 一并消失——校验一个已经不存在的字段没有意义。
 
-调用方自带历史（历史存在自己的库或缓存里）时，自己把业务消息转成 `schema.Message` 再逐条 `manager.Append`——`Message.Message2AI()` 与 `session.Manager.Append` 都是公开的，转换没有第二套口径。这里一度有个 `pi.AppendHistory` 包办这件事，因为只有测试在调、没有真实调用方，已删除（第七轮）。
+调用方自带历史（历史存在自己的库或缓存里）时，自己构造具体的 `schema.UserMessage` / `schema.AssistantMessage` 再逐条 `manager.Append`。Agent 的新输入入口是 `RunInput.Prompt`，历史不再通过 RunInput 传入。
 
 三种调用方各自的写法：
 
@@ -247,7 +247,7 @@ Agent 接上 `session.Append`；Run 出错时已产生的 entry 保留（崩溃�
 |---|---|
 | 会话要留档（默认） | 每轮 `session.OpenOrCreate(root, workDir, 会话键)` → `Options.Session`；同一键跨轮、跨进程都续同一个文件 |
 | 只想单轮跑一次 | `Session: session.InMemory()`，跑完就丢 |
-| 自己另有历史存储 | `session.InMemory()` + 自己转好（`Message2AI`）后逐条 `manager.Append`，之后每轮由 Agent 自己追加 |
+| 自己另有历史存储 | `session.InMemory()` + 自己构造具体消息后逐条 `manager.Append`，之后每轮由 Agent 自己追加 |
 
 pi.dev 那边灌历史也走公开的写入方法 `appendMessage`（agent-harness.ts:543）而不是"传历史"的构造参数，这一点仍然对齐；差别只是我们的对应物降了一层，是 `session.Manager.Append`，不是 `pi` 上的一个包办函数。
 

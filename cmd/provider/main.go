@@ -44,7 +44,7 @@ func buildProvider(opts *providers.Options) ai.Provider {
 }
 
 // consumeStream 消费整个流并打印事件，返回 Result。
-func consumeStream(stream ai.Stream) (schema.Message, error) {
+func consumeStream(stream ai.Stream) (*schema.AssistantMessage, error) {
 	defer stream.Close()
 
 	for stream.Next() {

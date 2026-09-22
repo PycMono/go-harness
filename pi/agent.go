@@ -151,7 +151,7 @@ func (a *Agent) Run(ctx context.Context, input *RunInput) (*RunOutput, error) {
 
 // prepareRunContext 准备执行 loop 的上下文
 func (a *Agent) prepareRunContext(ctx context.Context, input *RunInput) (*Context, error) {
-	inputMessage, err := input.Input.Message2AI()
+	inputMessage, err := input.promptMessage()
 	if err != nil {
 		return nil, err
 	}
@@ -165,14 +165,9 @@ func (a *Agent) prepareRunContext(ctx context.Context, input *RunInput) (*Contex
 		return nil, err
 	}
 
-	blocks := make([]*ContextBlock, len(input.Context))
-	for index, block := range input.Context {
-		blocks[index] = &ContextBlock{Name: block.Name, Content: block.Content, Priority: block.Priority}
-	}
-
 	// 工具定义交给上下文组装：上下文负责把它们和技能、系统提示词一起排好，
 	// 循环只消费组装结果。
-	return a.contextBuilder.Build(ctx, history, inputMessage, blocks, a.loop.definitions())
+	return a.contextBuilder.Build(ctx, history, inputMessage, nil, a.loop.definitions())
 }
 
 // history 组装本轮的历史消息：从会话重建，并把本轮输入也交给会话记账。

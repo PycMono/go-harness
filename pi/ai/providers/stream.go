@@ -9,7 +9,7 @@ type streamState struct {
 	current  schema.StreamEvent
 	started  bool
 	terminal bool
-	result   schema.Message
+	result   *schema.AssistantMessage
 	err      error
 }
 
@@ -20,7 +20,7 @@ func (s *streamState) Current() schema.StreamEvent { return s.current }
 // 两条纪律守住这个契约：错误路径只回 nil 消息；任何赋值都不得把
 // (*schema.AssistantMessage)(nil) 这类带类型的 nil 指针放进 result——那样接口非 nil，
 // 调用方的 message == nil 判定会静默走错分支。
-func (s *streamState) Result() (schema.Message, error) {
+func (s *streamState) Result() (*schema.AssistantMessage, error) {
 	if s.err != nil {
 		return nil, s.err
 	}

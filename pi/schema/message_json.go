@@ -6,10 +6,10 @@ import (
 	"strings"
 )
 
-// 本文件承载消息联合的 JSON 编解码：四个具体类型各自的 MarshalJSON、按 role 分发
-// 的 DecodeMessage，以及 Messages 序列的两个方法。线格式以重构前的 Message 结构体
-// 为准：字段名、声明顺序与 omitempty 语义逐字对齐，盘上已有的会话文件不迁移即可
-// 读取，重新编码后也是同一串字节。
+// 本文件承载一条消息的线格式：messageWire 载体、四个具体类型各自的 MarshalJSON、
+// 按 role 分发的 DecodeMessage。线格式以重构前的 Message 结构体为准：字段名、声明
+// 顺序与 omitempty 语义逐字对齐，盘上已有的会话文件不迁移即可读取，重新编码后也是
+// 同一串字节。
 
 // messageWire 是四个具体类型共用的线格式载体，取自旧 Message 结构体的字段与顺序。
 // 编码时各具体类型只填自己拥有的字段（其余零值被 omitempty 省掉），解码时先解成
@@ -152,36 +152,4 @@ func (wire messageWire) foreignFields() []string {
 	}
 
 	return foreign
-}
-
-// MarshalJSON 逐条调用具体类型的编码器：Messages 是接口切片，元素的编码只能由各自
-// 的 MarshalJSON 决定。nil 序列编码成 null，与旧的 []*Message 同形。
-func (m Messages) MarshalJSON() ([]byte, error) {
-	return json.Marshal([]Message(m))
-}
-
-// UnmarshalJSON 逐条调用 DecodeMessage，任一条解不出来就整段报错并点名是第几条：
-// 序列级校验（角色必须已知）由每条消息自己的解码保证，这里不重复。
-func (m *Messages) UnmarshalJSON(data []byte) error {
-	var items []json.RawMessage
-	if err := json.Unmarshal(data, &items); err != nil {
-		return fmt.Errorf("decode messages: %w", err)
-	}
-	if items == nil {
-		*m = nil
-
-		return nil
-	}
-
-	messages := make(Messages, 0, len(items))
-	for index, item := range items {
-		message, err := DecodeMessage(item)
-		if err != nil {
-			return fmt.Errorf("message %d: %w", index, err)
-		}
-		messages = append(messages, message)
-	}
-	*m = messages
-
-	return nil
 }

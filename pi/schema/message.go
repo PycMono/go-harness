@@ -1,11 +1,39 @@
+// Package schema 定义与模型平台无关的消息、内容块、工具 Schema、用量与流事件
+// 表示，并负责到 OpenAI / Anthropic 两套协议的转换。本包不依赖 SDK 内任何
+// 其他包。文件划分：message.go 承载消息这一个层次（Message 接口、四个具体类型
+// 与 Messages 序列）及其本地校验，message_json.go 承载一条消息的线格式（与旧
+// 结构体逐字节一致），message_content.go 承载内容块值类型，message_convert.go
+// 承载到 OpenAI / Anthropic 的双协议转换，usage.go 承载用量与流事件，tools.go
+// 承载工具侧（工具 Schema 与调用参数）。
 package schema
 
 import "fmt"
 
-// 本文件承载消息的四元判别联合：Message 接口与四个具体类型，各自的构造函数
-// 与本地校验。protocol.go 保留序列级校验与双协议转换。各具体类型只拥有自己
-// 角色的字段，角色由 Role 方法给出而不是结构体字段——同一类型上不能既有
-// Role 字段又有 Role 方法，字段集合也因此不会互相串味。
+// 本文件承载消息这一个层次：Message 接口、四个具体类型与 Messages 序列，各自的
+// 构造函数与本地校验，以及判别联合用到的 Role 与结束原因 FinishReason。一条消息
+// 的线格式在 message_json.go，内容块值类型在 message_content.go，双协议转换在
+// message_convert.go。各具体类型只拥有自己角色的字段，角色由 Role 方法给出而不是
+// 结构体字段——同一类型上不能既有 Role 字段又有 Role 方法，字段集合也因此不会互相
+// 串味。
+
+// Role 表示消息在大模型对话中的角色。
+type Role string
+
+const (
+	RoleSystem    Role = "system"    // RoleSystem 表示系统提示词。
+	RoleUser      Role = "user"      // RoleUser 表示用户输入。
+	RoleAssistant Role = "assistant" // RoleAssistant 表示模型输出。
+	RoleTool      Role = "tool"      // RoleTool 表示工具执行结果。
+)
+
+// FinishReason 表示模型结束当前响应的原因。
+type FinishReason string
+
+const (
+	FinishReasonStop    FinishReason = "stop"
+	FinishReasonToolUse FinishReason = "tool_use"
+	FinishReasonLength  FinishReason = "length"
+)
 
 // Message 表示对话上下文中的一条消息，取值必为 SystemMessage、UserMessage、
 // AssistantMessage、ToolResultMessage 之一。message 是私有标记方法，把实现
@@ -13,10 +41,40 @@ import "fmt"
 type Message interface {
 	// Role 返回本条消息的角色，也是判别联合的判别依据。
 	Role() Role
+	// Blocks 返回本条消息的内容块。只读展示、降级投影和日志这些不关心具体变体、
+	// 只要内容的路径用它，免去每个调用点各写一遍类型分支。叫 Blocks 而不是
+	// Content，是因为四个具体类型上都有 Content 字段，Go 不允许同名字段与方法
+	// 共存。接口本身为 nil 时不能调用；可能拿到 nil 的路径（如 header entry 的
+	// 空消息）由调用方先判空。
+	Blocks() ContentBlocks
 	// Validate 只校验本条消息自己的字段；角色已由具体类型确定，不重复传入。
 	Validate() error
 	// message 是私有标记方法，封闭本接口的实现集合。
 	message()
+}
+
+// Messages 是一条对话消息序列，元素为 Message 联合值。
+type Messages []Message
+
+// Validate 校验整个消息序列：角色必须已知，每条消息校验自己的字段（工具结果
+// 的 tool_call_id 与 tool_name 由 ToolResultMessage.Validate 负责，图片规则由
+// 各角色自己的 Validate 负责）。Provider 在入口边界统一调用，非法输入在协议
+// 转换前拦截，避免落成平台侧的模糊错误。
+func (m Messages) Validate() error {
+	for _, message := range m {
+		// 封闭联合下未知角色已不可表达，这条检查保留的是"角色必须已知"的
+		// 序列级契约本身：入口不接受来路不明的角色。
+		role := message.Role()
+		switch role {
+		case RoleSystem, RoleUser, RoleAssistant, RoleTool:
+		default:
+			return fmt.Errorf("unsupported message role %q", role)
+		}
+		if err := message.Validate(); err != nil {
+			return fmt.Errorf("message role %q: %w", role, err)
+		}
+	}
+	return nil
 }
 
 // SystemMessage 表示系统提示词消息，只接受纯文本。
@@ -36,6 +94,9 @@ func NewSystemMessage(content ContentBlocks) (Message, error) {
 
 // Role 返回 RoleSystem。
 func (m *SystemMessage) Role() Role { return RoleSystem }
+
+// Blocks 返回消息的内容块。
+func (m *SystemMessage) Blocks() ContentBlocks { return m.Content }
 
 func (m *SystemMessage) message() {}
 
@@ -69,6 +130,9 @@ func NewUserMessage(content ContentBlocks) (Message, error) {
 
 // Role 返回 RoleUser。
 func (m *UserMessage) Role() Role { return RoleUser }
+
+// Blocks 返回消息的内容块。
+func (m *UserMessage) Blocks() ContentBlocks { return m.Content }
 
 func (m *UserMessage) message() {}
 
@@ -105,6 +169,9 @@ func NewAssistantMessage(
 
 // Role 返回 RoleAssistant。
 func (m *AssistantMessage) Role() Role { return RoleAssistant }
+
+// Blocks 返回消息的内容块。
+func (m *AssistantMessage) Blocks() ContentBlocks { return m.Content }
 
 func (m *AssistantMessage) message() {}
 
@@ -148,6 +215,9 @@ func NewToolResultMessage(
 
 // Role 返回 RoleTool。
 func (m *ToolResultMessage) Role() Role { return RoleTool }
+
+// Blocks 返回消息的内容块。
+func (m *ToolResultMessage) Blocks() ContentBlocks { return m.Content }
 
 func (m *ToolResultMessage) message() {}
 

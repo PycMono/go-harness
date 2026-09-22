@@ -129,7 +129,7 @@ func main() {
 	println("-------------------------")
 
 	output, err := agent.Run(ctx, &pi.RunInput{
-		Input: &pi.Message{ContentType: "text", SenderType: "customer", Content: *prompt},
+		Prompt: *prompt,
 	})
 	if err != nil {
 		if output != nil {
@@ -204,7 +204,7 @@ func renderMessage(message schema.Message) string {
 		}
 		return fmt.Sprintf("[tool:%s] %s: %s\n", result.ToolName, status, firstLine(displayText(result.Content)))
 	default:
-		return fmt.Sprintf("[%s] %s\n", message.Role(), firstLine(displayText(schema.ContentOf(message))))
+		return fmt.Sprintf("[%s] %s\n", message.Role(), firstLine(displayText(message.Blocks())))
 	}
 }
 

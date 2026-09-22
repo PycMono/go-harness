@@ -157,7 +157,7 @@ func runTurn(ctx context.Context, opts *providers.Options, root string, manager 
 
 	fmt.Printf("\n--- 输入: %s ---\n", prompt)
 	output, err := agent.Run(ctx, &pi.RunInput{
-		Input: &pi.Message{ContentType: "text", SenderType: "customer", Content: prompt},
+		Prompt: prompt,
 	})
 	if err != nil {
 		if output != nil {
@@ -334,7 +334,7 @@ func messageText(message schema.Message) string {
 	if message == nil {
 		return messageMissing
 	}
-	return firstLine(displayText(schema.ContentOf(message)))
+	return firstLine(displayText(message.Blocks()))
 }
 
 // displayText 把内容块投影成可展示文本：图片块换成脱敏占位，消息不再因为带图而打印成

@@ -20,6 +20,6 @@ type Stream interface {
 	Current() schema.StreamEvent
 	// Result 返回流结束时产出的消息。没有产出或流失败时返回 nil 接口，调用方
 	// 用 message == nil 判定即可；实现方不得把带类型的 nil 指针塞进这个接口。
-	Result() (schema.Message, error)
+	Result() (*schema.AssistantMessage, error)
 	Close() error
 }

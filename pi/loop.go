@@ -128,14 +128,9 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 		if err != nil {
 			return state.messages, err
 		}
-		// 这一轮的模型消息必须是助手消息：交回 nil 接口或别的具体类型都说明流
-		// 实现破坏了契约。这里必须报内部错误——按"没有工具调用"处理会让一次
-		// 坏掉的响应看起来像正常收尾，循环静默结束。
-		assistant, ok := message.(*schema.AssistantMessage)
-		if !ok {
-			return state.messages, pierrors.ErrInternal.Wrap(fmt.Errorf(
-				"模型响应不是助手消息: %T", message))
-		}
+		// Provider 的 Stream.Result 已经把返回类型收窄为助手消息，Loop 不再需要
+		// 对通用 Message 做运行时类型断言。
+		assistant := message
 		// 模型消息先入列：工具结果必须紧跟在发起调用的那条助手消息之后，
 		// 两家协议都按这个顺序还原上下文。
 		state.messages = append(state.messages, message)
@@ -174,7 +169,7 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 //
 // Stream 是拉取式的：Result() 要等流读到结束才有效（结果与错误都在那条路径
 // 上产生），所以这里必须一直 Next() 到返回 false。
-func (l *Loop) complete(ctx context.Context, state *runState) (schema.Message, error) {
+func (l *Loop) complete(ctx context.Context, state *runState) (*schema.AssistantMessage, error) {
 	stream := l.provider.Stream(ctx, state.messages, state.availableTools)
 	defer stream.Close()
 

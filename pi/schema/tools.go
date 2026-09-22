@@ -125,26 +125,6 @@ func (t ToolDefinitions) ToAnthropicTools() ([]anthropicsdk.ToolUnionParam, erro
 	return result, nil
 }
 
-// Has 报告是否存在指定名称的工具定义。
-func (t ToolDefinitions) Has(name string) bool {
-	for _, definition := range t {
-		if definition.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-// ParallelSafety 返回每个工具名称对应的并发安全标记快照。
-func (t ToolDefinitions) ParallelSafety() map[string]bool {
-	parallelSafes := make(map[string]bool, len(t))
-	for _, definition := range t {
-		parallelSafes[definition.Name] = definition.ParallelSafe
-	}
-
-	return parallelSafes
-}
-
 // ToolOutput 是工具一次执行的返回值。执行域据此构造 RoleTool 消息，
 // Content 直接作为消息内容块写入上下文。
 type ToolOutput struct {

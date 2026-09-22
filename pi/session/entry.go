@@ -61,8 +61,7 @@ func (entry *Entry) UnmarshalJSON(data []byte) error {
 type Header struct {
 	// ID 会话 id（pi.dev 同名 id），与首条 entry 自己的 ID 同值，也是 parent 链的根。
 	ID string `json:"id"`
-	// Version 文件格式版本（pi.dev 同名 version，v1 的文件没这个字段），当前 1。
-	// load 不校验它：未知版本今天照样能打开（见 validate）。
+	// Version 文件格式版本。当前会话协议版本为 2，读取时严格校验。
 	Version int `json:"version"`
 	// CreatedAt 会话创建时间（对应 pi.dev 首行的 timestamp），RFC3339 UTC。
 	CreatedAt string `json:"created_at"`

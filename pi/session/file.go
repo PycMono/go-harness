@@ -58,6 +58,9 @@ func (f *sessionFile) load() (Entries, error) {
 	if err = header.validate(); err != nil {
 		return nil, f.invalid(err)
 	}
+	if header.Header.Version != sessionVersion {
+		return nil, f.invalid(fmt.Errorf("不支持的会话文件版本 %d，当前版本为 %d", header.Header.Version, sessionVersion))
+	}
 
 	entries := make(Entries, 1, len(lines))
 	entries[0] = header
