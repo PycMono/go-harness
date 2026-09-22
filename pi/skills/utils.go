@@ -52,7 +52,7 @@ func sanitizeXMLText(value string) string {
 		if isValidXMLCharacter(character) {
 			return character
 		}
-		
+
 		return '\uFFFD'
 	}, value)
 }
