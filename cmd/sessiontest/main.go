@@ -246,10 +246,16 @@ func interactiveAppend(sessions, root, sessionKey string) {
 
 // appendPair 追加一轮"用户说了什么 + 助手回什么"，离线模式下代替真实 Run。
 func appendPair(manager *session.Manager, prompt, reply string) {
-	turns := []*schema.Message{
-		{Role: schema.RoleUser, Content: schema.ContentBlocks{schema.TextBlock(prompt)}},
-		{Role: schema.RoleAssistant, Content: schema.ContentBlocks{schema.TextBlock(reply)}},
+	userMessage, err := schema.NewUserMessage(schema.ContentBlocks{schema.TextBlock(prompt)})
+	if err != nil {
+		fail(fmt.Errorf("构造用户消息失败: %w", err))
 	}
+	assistantMessage, err := schema.NewAssistantMessage(
+		schema.ContentBlocks{schema.TextBlock(reply)}, nil, "", nil)
+	if err != nil {
+		fail(fmt.Errorf("构造助手消息失败: %w", err))
+	}
+	turns := schema.Messages{userMessage, assistantMessage}
 	for _, message := range turns {
 		if err := manager.Append(session.Entry{Type: session.EntryMessage, Message: message}); err != nil {
 			fail(fmt.Errorf("追加消息失败: %w", err))
@@ -268,22 +274,30 @@ func reportRound(round int, manager *session.Manager) {
 		round, len(manager.Entries()), info.Size(), manager.Path())
 }
 
+// messageMissing 是消息载荷缺失时的标记文本。接口为 nil 就是没有载荷（header entry
+// 就是这样），展示路径给一条带标记的行，而不是空串或 panic。
+const messageMissing = "!消息载荷缺失"
+
 // printEntries 打印会话文件里的 entry 链条。
 func printEntries(manager *session.Manager) {
 	entries := manager.Entries()
 	fmt.Printf("\n=== 会话 entry（%d 条，叶子 %s）===\n", len(entries), manager.LeafID())
 	for index, entry := range entries {
-		switch entry.Type {
-		case session.EntryHeader:
-			fmt.Printf("%2d [%s] header %s workdir=%s\n",
-				index, entry.ID, entry.Header.ID, entry.Header.WorkDir)
-		case session.EntryMessage:
-			text, _ := entry.Message.Content.Text()
-			fmt.Printf("%2d [%s] ← %s message %s: %s\n",
-				index, entry.ID, entry.ParentID, entry.Message.Role, firstLine(text))
-		default:
-			fmt.Printf("%2d [%s] ← %s %s\n", index, entry.ID, entry.ParentID, entry.Type)
-		}
+		fmt.Printf("%2d %s", index, renderEntry(entry))
+	}
+}
+
+// renderEntry 把一条 entry 渲染成一行（不含行首的序号列）。header 行只有元信息，
+// 它的 Message 是 nil 接口，这条路径不碰载荷；message 行委派给消息侧的投影。
+func renderEntry(entry session.Entry) string {
+	switch entry.Type {
+	case session.EntryHeader:
+		return fmt.Sprintf("[%s] header %s workdir=%s\n", entry.ID, entry.Header.ID, entry.Header.WorkDir)
+	case session.EntryMessage:
+		return fmt.Sprintf("[%s] ← %s message %s: %s\n",
+			entry.ID, entry.ParentID, messageRole(entry.Message), messageText(entry.Message))
+	default:
+		return fmt.Sprintf("[%s] ← %s %s\n", entry.ID, entry.ParentID, entry.Type)
 	}
 }
 
@@ -295,9 +309,43 @@ func printMessages(messages schema.Messages) {
 		return
 	}
 	for index, message := range messages {
-		text, _ := message.Content.Text()
-		fmt.Printf("%2d [%s] %s\n", index, message.Role, firstLine(text))
+		fmt.Printf("%2d %s", index, renderMessage(message))
 	}
+}
+
+// renderMessage 把重建出来的一条消息渲染成一行（不含行首的序号列）。纯函数、不碰
+// 标准输出，打印与断言共用同一份渲染。
+func renderMessage(message schema.Message) string {
+	return fmt.Sprintf("[%s] %s\n", messageRole(message), messageText(message))
+}
+
+// messageRole 返回消息角色的展示词；载荷缺失（header entry 的 nil 接口）时用 "?" 占位，
+// 不去解引用。
+func messageRole(message schema.Message) schema.Role {
+	if message == nil {
+		return "?"
+	}
+	return message.Role()
+}
+
+// messageText 返回消息的可展示正文：图片块换成脱敏占位（[图片: scheme://host/path]），
+// 再取首行并限长。entry 行与重建上下文行共用这份投影，两处只差前缀。
+func messageText(message schema.Message) string {
+	if message == nil {
+		return messageMissing
+	}
+	return firstLine(displayText(schema.ContentOf(message)))
+}
+
+// displayText 把内容块投影成可展示文本：图片块换成脱敏占位，消息不再因为带图而打印成
+// 空。脏块（图片块缺 Image）连占位都投影不出来，严格的 Text() 会报错，这时给一条带标记
+// 的降级文本——空串会让人分不清"这条消息没文本"和"渲染失败了"。
+func displayText(content schema.ContentBlocks) string {
+	text, err := content.WithImagePlaceholders().Text()
+	if err != nil {
+		return fmt.Sprintf("[内容渲染失败: %v]", err)
+	}
+	return text
 }
 
 // firstLine 只取首行并限长，上下文里的系统提示词与摘要可能很长。

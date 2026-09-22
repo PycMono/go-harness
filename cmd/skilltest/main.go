@@ -166,27 +166,57 @@ func printSystemPrompt(root, prompt string) {
 	fmt.Printf("\n--- 系统提示词全文 ---\n%s\n", prompt)
 }
 
+// shapeMismatch 标记展示路径上"角色与具体类型对不上"的消息。角色与具体类型由封闭
+// 联合绑在一起，正常路径到不了这里；这条兜底只负责不 panic、也不静默丢消息。
+const shapeMismatch = "!消息形状与角色不符"
+
 // printTranscript 按顺序打印消息序列，工具调用与工具结果各压成一行。
 func printTranscript(messages schema.Messages) {
 	fmt.Printf("\n=== 消息序列 ===\n")
 	for _, message := range messages {
-		text, _ := message.Content.Text()
-		switch message.Role {
-		case schema.RoleAssistant:
-			fmt.Printf("[assistant] %s\n", text)
-			for _, call := range message.ToolCalls {
-				fmt.Printf("            └ call %s %s\n", call.Name, string(call.Arguments))
-			}
-		case schema.RoleTool:
-			status := "result"
-			if message.IsError {
-				status = "error"
-			}
-			fmt.Printf("[tool:%s] %s: %s\n", message.ToolName, status, firstLine(text))
-		default:
-			fmt.Printf("[%s] %s\n", message.Role, firstLine(text))
-		}
+		fmt.Print(renderMessage(message))
 	}
+}
+
+// renderMessage 把一条消息渲染成终端上的一段（助手消息的每个工具调用各占一行）。
+// 纯函数、不碰标准输出，所以打印与断言共用同一份渲染。
+func renderMessage(message schema.Message) string {
+	switch message.Role() {
+	case schema.RoleAssistant:
+		assistant, ok := message.(*schema.AssistantMessage)
+		if !ok {
+			return fmt.Sprintf("[assistant] %s\n", shapeMismatch)
+		}
+		var builder strings.Builder
+		fmt.Fprintf(&builder, "[assistant] %s\n", displayText(assistant.Content))
+		for _, call := range assistant.ToolCalls {
+			fmt.Fprintf(&builder, "            └ call %s %s\n", call.Name, string(call.Arguments))
+		}
+		return builder.String()
+	case schema.RoleTool:
+		result, ok := message.(*schema.ToolResultMessage)
+		if !ok {
+			return fmt.Sprintf("[tool] %s\n", shapeMismatch)
+		}
+		status := "result"
+		if result.IsError {
+			status = "error"
+		}
+		return fmt.Sprintf("[tool:%s] %s: %s\n", result.ToolName, status, firstLine(displayText(result.Content)))
+	default:
+		return fmt.Sprintf("[%s] %s\n", message.Role(), firstLine(displayText(schema.ContentOf(message))))
+	}
+}
+
+// displayText 把内容块投影成可展示文本：图片块换成脱敏占位（[图片: scheme://host/path]），
+// 消息不再因为带图而打印成空。脏块（图片块缺 Image）连占位都投影不出来，严格的 Text()
+// 会报错，这时给一条带标记的降级文本——空串会让人分不清"这条消息没文本"和"渲染失败了"。
+func displayText(content schema.ContentBlocks) string {
+	text, err := content.WithImagePlaceholders().Text()
+	if err != nil {
+		return fmt.Sprintf("[内容渲染失败: %v]", err)
+	}
+	return text
 }
 
 // firstLine 只取首行并限长，消息序列里系统提示词与上下文可能很长。
