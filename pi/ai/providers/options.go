@@ -22,6 +22,12 @@ type Options struct {
 	BaseURL  string   `json:"baseURL"`
 	APIKey   string   `json:"apiKey"`
 	Model    string   `json:"model"`
+	// SupportsImageInput 表示该模型接受图片输入。OpenAI 协议的 tool 消息只有文本
+	// 位置，工具结果的图片进不去，只有本开关为真时才在工具结果之后补一条合成 user
+	// 消息携带图片；缺省为假，图片按占位文本降级，不会静默丢弃（见同包 openai.go
+	// 的 insertToolResultImages）。Anthropic 不读这个开关：它的 tool_result 内容块
+	// 本身就接受图片，走的是 schema 的 anthropicToolResultContent。
+	SupportsImageInput bool `json:"supportsImageInput,omitempty"`
 }
 
 // Validate 校验

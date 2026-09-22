@@ -19,6 +19,9 @@ type OpenAIImpl struct {
 	client openaisdk.Client
 	model  string
 	name   string
+	// supportsImageInput 来自 Options.SupportsImageInput，决定工具结果的图片要不要
+	// 以合成 user 消息补发。
+	supportsImageInput bool
 }
 
 func NewOpenAI(opts *Options) ai.Provider {
@@ -28,8 +31,9 @@ func NewOpenAI(opts *Options) ai.Provider {
 			option.WithBaseURL(opts.BaseURL),
 			option.WithMaxRetries(0),
 		),
-		model: opts.Model,
-		name:  opts.ID,
+		model:              opts.Model,
+		name:               opts.ID,
+		supportsImageInput: opts.SupportsImageInput,
 	}
 }
 
@@ -46,6 +50,8 @@ func (o *OpenAIImpl) Stream(
 	if err != nil {
 		return newFailedStream(pierrors.ErrAIGeneration.Wrap(fmt.Errorf("%s 消息转换失败: %w", o.name, err)))
 	}
+	// 工具结果的图片没有 tool 消息位置可去，转换之后再按模型能力补一条合成 user 消息。
+	openAIMessages = insertToolResultImages(msgs, openAIMessages, o.supportsImageInput)
 
 	openAITools, err := definitions.ToOpenAITools()
 	if err != nil {
@@ -62,6 +68,128 @@ func (o *OpenAIImpl) Stream(
 	}
 
 	return &openAIStream{provider: o, stream: o.client.Chat.Completions.NewStreaming(ctx, params)}
+}
+
+// toolResultImageNotice 是合成 user 消息的锚点文本，字面量照搬 pi.dev
+// （openai-completions.ts:1453）。
+const toolResultImageNotice = "Attached image(s) from tool result:"
+
+// toolResultImageBatch 是一段连续工具结果运行里收集到的图片。
+type toolResultImageBatch struct {
+	// toolCallID 是这段运行最后一条工具结果的 tool_call_id，合成 user 消息插在它后面。
+	toolCallID string
+	// urls 是按"消息顺序 → 块顺序"收集到的图片 URL。
+	urls []string
+}
+
+// insertToolResultImages 给携带图片的工具结果补一条合成 user 消息。OpenAI 的 tool
+// 消息只有文本位置，图片进不去；补发形状与插入位置对齐 pi.dev 的
+// openai-completions.ts:1396-1458：
+//
+//   - 运行（run）是 msgs 里极大的一段连续 ToolResultMessage。图片跨整段收集，所以两条
+//     相邻的带图工具结果只补一条 user 消息，不是两条；结果顺序是
+//     assistant(tool_calls)、tool、tool、user（计划第 118 行钉住的顺序）。
+//   - 只有 supportsImageInput 为真、且这段运行至少收到一张图时才补。开关为假时一条都
+//     不补，图片由任务三给工具消息的文本兜底（有文本用文本、无文本有图用
+//     "(see attached image)"），不会静默丢图。
+//   - 合成消息的内容是锚点文本加每张图一个 image_url 成员，URL 逐字取
+//     Image.URL——schema.ImageContent 只有 URL，没有 base64 与 MIME，所以这不是
+//     pi.dev 的 data: URI。
+//   - 不补 pi.dev 那条可选的 "I have processed the tool results." 助手消息：它由
+//     compat.requiresAssistantAfterToolResult 控制（:1441-1446），go-harness 没有这个
+//     兼容位，计划钉住的顺序就是不含它的那一种。
+//   - 插入点按 tool_call_id 匹配 OfTool 分支，不按下标：下标对齐是没有任何东西保证的
+//     不变量，一旦破了就是静默的错序错图。
+//
+// 包级函数，不碰协议转换也不读 provider，测试可以直接喂消息与参数。
+func insertToolResultImages(
+	msgs schema.Messages,
+	params []openaisdk.ChatCompletionMessageParamUnion,
+	supportsImageInput bool,
+) []openaisdk.ChatCompletionMessageParamUnion {
+	if !supportsImageInput {
+		return params
+	}
+
+	batches := collectToolResultImageBatches(msgs)
+	if len(batches) == 0 {
+		return params
+	}
+
+	// 按 params 的顺序单趟插：批次与参数里 tool_call_id 的出现顺序一致，所以游标只前进。
+	// 某个批次在 params 里找不到对应 tool 消息时后面的批次也不会插——那说明 msgs 与
+	// params 不是同一次转换的产物，属于上游 bug，不该在这里猜着补。
+	result := make([]openaisdk.ChatCompletionMessageParamUnion, 0, len(params)+len(batches))
+	next := 0
+	for _, param := range params {
+		result = append(result, param)
+		if next < len(batches) && param.OfTool != nil &&
+			param.OfTool.ToolCallID == batches[next].toolCallID {
+			result = append(result, toolResultImageUserMessage(batches[next].urls))
+			next++
+		}
+	}
+
+	return result
+}
+
+// collectToolResultImageBatches 扫出所有至少收到一张图的工具结果运行，按出现顺序返回。
+func collectToolResultImageBatches(msgs schema.Messages) []toolResultImageBatch {
+	batches := make([]toolResultImageBatch, 0)
+	for index := 0; index < len(msgs); {
+		if _, ok := msgs[index].(*schema.ToolResultMessage); !ok {
+			index++
+			continue
+		}
+
+		batch := toolResultImageBatch{}
+		for ; index < len(msgs); index++ {
+			tool, ok := msgs[index].(*schema.ToolResultMessage)
+			if !ok {
+				break
+			}
+			batch.toolCallID = tool.ToolCallID
+			batch.urls = append(batch.urls, toolResultImageURLs(tool.Content)...)
+		}
+		if len(batch.urls) > 0 {
+			batches = append(batches, batch)
+		}
+	}
+
+	return batches
+}
+
+// toolResultImageURLs 按块顺序取出一条工具结果里的图片 URL。image 块缺 Image 时跳过
+// 而不是 panic：这种脏块在上游 Messages.Validate 就被拒了，这里只是不让它把整条合成
+// 消息带塌。
+func toolResultImageURLs(blocks schema.ContentBlocks) []string {
+	var urls []string
+	for _, block := range blocks {
+		if block.Type == schema.ContentTypeImage && block.Image != nil {
+			urls = append(urls, block.Image.URL)
+		}
+	}
+
+	return urls
+}
+
+// toolResultImageUserMessage 组装携带工具结果图片的合成 user 消息，成员形状与既有的
+// 用户图片路径一致（schema 的 toOpenAIUserMessage）：锚点文本在前，之后每张图一个
+// image_url 成员。
+func toolResultImageUserMessage(imageURLs []string) openaisdk.ChatCompletionMessageParamUnion {
+	parts := make([]openaisdk.ChatCompletionContentPartUnionParam, 0, len(imageURLs)+1)
+	parts = append(parts, openaisdk.ChatCompletionContentPartUnionParam{
+		OfText: &openaisdk.ChatCompletionContentPartTextParam{Text: toolResultImageNotice},
+	})
+	for _, imageURL := range imageURLs {
+		parts = append(parts, openaisdk.ChatCompletionContentPartUnionParam{
+			OfImageURL: &openaisdk.ChatCompletionContentPartImageParam{
+				ImageURL: openaisdk.ChatCompletionContentPartImageImageURLParam{URL: imageURL},
+			},
+		})
+	}
+
+	return openaisdk.UserMessage(parts)
 }
 
 func (o *OpenAIImpl) classifyError(err error) error {
@@ -162,8 +290,7 @@ func (s *openAIStream) finish() error {
 	}
 
 	message := response.Choices[0].Message
-	result := &schema.Message{
-		Role:         schema.RoleAssistant,
+	result := &schema.AssistantMessage{
 		FinishReason: openAIFinishReason(response.Choices[0].FinishReason),
 	}
 	if message.Content != "" {

@@ -123,7 +123,7 @@ func (s *anthropicStream) finish() error {
 		)
 	}
 
-	result := &schema.Message{Role: schema.RoleAssistant, FinishReason: anthropicFinishReason(s.message.StopReason)}
+	result := &schema.AssistantMessage{FinishReason: anthropicFinishReason(s.message.StopReason)}
 	for _, block := range s.message.Content {
 		switch block.Type {
 		case "text":
