@@ -36,8 +36,10 @@ type Message struct {
 	SenderType string
 }
 
-// Message2AI 校验业务消息并转换为模型内部消息。
-func (message Message) Message2AI() (*schema.Message, error) {
+// Message2AI 校验业务消息并转换为模型内部消息。返回的是联合类型的接口：
+// 校验失败时交回 nil 接口，而不是一个带类型的 nil 指针——后者在调用方眼里
+// 依旧非 nil，会把"校验失败"读成"拿到了一条消息"。
+func (message Message) Message2AI() (schema.Message, error) {
 	if message.ContentType != "text" {
 		return nil, pierrors.ErrRequestInvalid.Wrap(fmt.Errorf(
 			"message content type must be %q, got %q",
@@ -82,7 +84,13 @@ func (message Message) Message2AI() (*schema.Message, error) {
 			content = append(content, block)
 		}
 	}
-	return &schema.Message{Role: role, Content: content}, nil
+	// 内容块在上面逐条校验过，构造函数不会再拦下什么；它按 role 落到对应的具体
+	// 类型上，两条路径的失败都是 nil 接口。
+	if role == schema.RoleUser {
+		return schema.NewUserMessage(content)
+	}
+
+	return schema.NewAssistantMessage(content, nil, "", nil)
 }
 
 type RunInput struct {
@@ -129,10 +137,11 @@ func (r *RunOutput) Messages() schema.Messages {
 }
 
 // Message 返回本轮最后一条模型消息，即面向调用方的最终答复；模型一次都没
-// 有输出时返回 nil。
-func (r *RunOutput) Message() *schema.Message {
+// 有输出时返回 nil。返回的是接口，nil 必须是裸 nil——带类型的 nil 指针在这里
+// 依旧非 nil，调用方的"没有答复"判定会静默走错分支。
+func (r *RunOutput) Message() schema.Message {
 	for index := len(r.message) - 1; index >= 0; index-- {
-		if r.message[index].Role == schema.RoleAssistant {
+		if r.message[index].Role() == schema.RoleAssistant {
 			return r.message[index]
 		}
 	}
@@ -140,13 +149,17 @@ func (r *RunOutput) Message() *schema.Message {
 	return nil
 }
 
-// Text 返回最终答复的纯文本内容；没有模型消息或内容为空时返回空字符串。
+// Text 返回最终答复的纯文本内容；没有模型消息或内容不是纯文本时返回空字符串。
 func (r *RunOutput) Text() string {
 	message := r.Message()
 	if message == nil {
 		return ""
 	}
-	text, err := message.Content.Text()
+	assistant, ok := message.(*schema.AssistantMessage)
+	if !ok {
+		return ""
+	}
+	text, err := assistant.Content.Text()
 	if err != nil {
 		return ""
 	}

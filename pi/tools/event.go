@@ -77,12 +77,10 @@ func NewRejectedEvent(call schema.ToolCall, codeErr *pierrors.CodeError, text st
 }
 
 // ResultMessage 将工具结束事件转换为模型消息，复制内容以隔离后续修改。
-func (event Event) ResultMessage() schema.Message {
-	return schema.Message{
-		Role:       schema.RoleTool,
-		Content:    event.Content.Clone(),
-		ToolCallID: event.Call.ID,
-		ToolName:   event.Call.Name,
-		IsError:    event.IsError,
-	}
+// 返回的是联合类型的接口：结束事件缺调用 ID 或工具名时交回错误——身份不全的
+// 结果回填不到任何一次调用上，宁可报错也不要产出一条半成品消息。
+func (event Event) ResultMessage() (schema.Message, error) {
+	return schema.NewToolResultMessage(
+		event.Content.Clone(), event.Call.ID, event.Call.Name, event.IsError,
+	)
 }

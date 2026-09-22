@@ -20,22 +20,20 @@ func TestMessage2AISuccessCases(t *testing.T) {
 	cases := []struct {
 		name    string
 		message Message
-		want    *schema.Message
+		want    schema.Message
 	}{
 		{
 			name: "customer 纯文本",
 			// 前后空格只参与"是不是空白"的判定，不参与清洗：正文原样进内容块。
 			message: Message{ContentType: "text", SenderType: "customer", Content: "  基线用户输入  "},
-			want: &schema.Message{
-				Role:    schema.RoleUser,
+			want: &schema.UserMessage{
 				Content: schema.ContentBlocks{schema.TextBlock("  基线用户输入  ")},
 			},
 		},
 		{
 			name:    "ai 纯文本",
 			message: Message{ContentType: "text", SenderType: "ai", Content: "基线模型输出"},
-			want: &schema.Message{
-				Role:    schema.RoleAssistant,
+			want: &schema.AssistantMessage{
 				Content: schema.ContentBlocks{schema.TextBlock("基线模型输出")},
 			},
 		},
@@ -45,8 +43,7 @@ func TestMessage2AISuccessCases(t *testing.T) {
 				ContentType: "text", SenderType: "customer", Content: "看图",
 				ImageURLs: []string{characterizationImageURL},
 			},
-			want: &schema.Message{
-				Role: schema.RoleUser,
+			want: &schema.UserMessage{
 				Content: schema.ContentBlocks{
 					schema.TextBlock("看图"),
 					schema.ImageBlock(characterizationImageURL),
@@ -64,8 +61,7 @@ func TestMessage2AISuccessCases(t *testing.T) {
 					"https://example.test/4.png",
 				},
 			},
-			want: &schema.Message{
-				Role: schema.RoleUser,
+			want: &schema.UserMessage{
 				Content: schema.ContentBlocks{
 					schema.TextBlock("四张图"),
 					schema.ImageBlock("https://example.test/1.png"),
@@ -83,17 +79,18 @@ func TestMessage2AISuccessCases(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Message2AI: %v", err)
 			}
-			if got.Role != testCase.want.Role {
-				t.Fatalf("role = %q，想要 %q", got.Role, testCase.want.Role)
+			if got.Role() != testCase.want.Role() {
+				t.Fatalf("role = %q，想要 %q", got.Role(), testCase.want.Role())
 			}
 			// 文本块在前、图片块按 ImageURLs 的顺序追加在后。
-			assertContentBlocks(t, got.Content, testCase.want.Content)
+			assertContentBlocks(t, contentOf(t, got), contentOf(t, testCase.want))
 			// Message2AI 只产出 role + content，不碰其他载荷。
-			if got.Usage != nil {
-				t.Fatalf("Message2AI 填了 Usage: %+v", got.Usage)
+			usage, toolCalls := assistantPayloadOf(got)
+			if usage != nil {
+				t.Fatalf("Message2AI 填了 Usage: %+v", usage)
 			}
-			if len(got.ToolCalls) != 0 {
-				t.Fatalf("Message2AI 填了 ToolCalls: %+v", got.ToolCalls)
+			if len(toolCalls) != 0 {
+				t.Fatalf("Message2AI 填了 ToolCalls: %+v", toolCalls)
 			}
 		})
 	}
@@ -265,6 +262,33 @@ func TestMessage2AIValidationOrder(t *testing.T) {
 			}
 		})
 	}
+}
+
+// contentOf 取联合消息的内容块。内容块挂在具体类型上，role 之外没有公共读取口，
+// 只能断言具体类型再读；Message2AI 只产出 user 与 assistant 两种。
+func contentOf(t *testing.T, message schema.Message) schema.ContentBlocks {
+	t.Helper()
+
+	switch typed := message.(type) {
+	case *schema.UserMessage:
+		return typed.Content
+	case *schema.AssistantMessage:
+		return typed.Content
+	default:
+		t.Fatalf("消息的动态类型 = %T，不是 *schema.UserMessage 或 *schema.AssistantMessage", message)
+		return nil
+	}
+}
+
+// assistantPayloadOf 取 assistant 消息的用量与工具调用；其余角色没有这两样载荷，
+// 按"没填"返回零值。
+func assistantPayloadOf(message schema.Message) (*schema.Usage, schema.ToolCalls) {
+	assistant, ok := message.(*schema.AssistantMessage)
+	if !ok {
+		return nil, nil
+	}
+
+	return assistant.Usage, assistant.ToolCalls
 }
 
 // requireRequestInvalid 断言 err 挂了 ErrRequestInvalid 这个稳定码。

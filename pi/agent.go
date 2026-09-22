@@ -107,7 +107,7 @@ func newAgent(provider ai.Provider, opts *Options) (*Agent, error) {
 		WithScheduler(tools.NewScheduler(registry, maxParallel, opts.Observer, middleware.Defaults()...)),
 		WithTextObserver(opts.TextObserver),
 		WithMaxTurns(opts.MaxTurns),
-		WithMessageObserver(func(message *schema.Message) {
+		WithMessageObserver(func(message schema.Message) {
 			// 已经出过错就不再往下写：一次写入失败会滚成一串，真正有用的只有第一个。
 			if agent.writeErr != nil {
 				return
@@ -155,7 +155,7 @@ func (a *Agent) prepareRunContext(ctx context.Context, input *RunInput) (*Contex
 	if err != nil {
 		return nil, err
 	}
-	if inputMessage.Role != schema.RoleUser {
+	if inputMessage.Role() != schema.RoleUser {
 		return nil, pierrors.ErrRequestInvalid.Wrap(
 			fmt.Errorf("input sender type must be customer"))
 	}
@@ -176,7 +176,7 @@ func (a *Agent) prepareRunContext(ctx context.Context, input *RunInput) (*Contex
 }
 
 // history 组装本轮的历史消息：从会话重建，并把本轮输入也交给会话记账。
-func (a *Agent) history(inputMessage *schema.Message) (schema.Messages, error) {
+func (a *Agent) history(inputMessage schema.Message) (schema.Messages, error) {
 	// 重建必须在追加本轮输入之前：先落盘再重建的话，这条输入会既在历史里、
 	// 又被上下文组装再追加一次。
 	history := a.session.BuildMessages()

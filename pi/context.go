@@ -33,7 +33,7 @@ func NewContextBuilder(workDir string) *ContextBuilder {
 func (c *ContextBuilder) Build(
 	ctx context.Context,
 	history schema.Messages,
-	input *schema.Message,
+	input schema.Message,
 	contextBlocks []*ContextBlock,
 	definitions schema.ToolDefinitions) (*Context, error) {
 	// 组装系统提示词（核心纪律 + 技能目录 + AGENTS.md，细节见 prompt.go）
@@ -41,14 +41,14 @@ func (c *ContextBuilder) Build(
 	if err != nil {
 		return nil, err
 	}
-	systemMessage := &schema.Message{
-		Role:    schema.RoleSystem,
-		Content: []schema.ContentBlock{schema.TextBlock(sysPrompt)},
+	systemMessage, err := schema.NewSystemMessage([]schema.ContentBlock{schema.TextBlock(sysPrompt)})
+	if err != nil {
+		return nil, err
 	}
 
 	// 处理消息
-	messages := make([]*schema.Message, 0, 2+len(contextBlocks)+len(history))
-	messages = append(messages, append([]*schema.Message(nil), history...)...)
+	messages := make([]schema.Message, 0, 2+len(contextBlocks)+len(history))
+	messages = append(messages, history...)
 	// 本轮输入落在历史之后，压缩要按这个下标认出"客户这次说了什么"。
 	currentInputIndex := len(messages)
 	messages = append(messages, input)
@@ -60,12 +60,15 @@ func (c *ContextBuilder) Build(
 		return blocks[i].Priority > blocks[j].Priority
 	})
 	for _, block := range blocks {
-		messages = append(messages, &schema.Message{
-			Role: schema.RoleSystem,
-			Content: []schema.ContentBlock{schema.TextBlock(
-				"# Context: " + strings.TrimSpace(block.Name) + "\n" + block.Content,
-			)},
-		})
+		// 系统提示词与业务上下文块共用同一个位置：都在本轮输入之后，作为对话
+		// 中间的系统消息插进去。
+		contextMessage, err := schema.NewSystemMessage([]schema.ContentBlock{schema.TextBlock(
+			"# Context: " + strings.TrimSpace(block.Name) + "\n" + block.Content,
+		)})
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, contextMessage)
 	}
 
 	return &Context{

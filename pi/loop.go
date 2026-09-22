@@ -71,7 +71,7 @@ func WithMaxTurns(n int) LoopOption {
 }
 
 // MessageObserver 接收循环逐条产生的模型消息与工具结果消息。
-type MessageObserver func(message *schema.Message)
+type MessageObserver func(message schema.Message)
 
 // WithMessageObserver 逐条接收循环产生的消息，用于会话持久化；不设置时
 // 行为不变，与 TextObserver 一样在单线程控制流中同步调用。
@@ -81,7 +81,7 @@ func WithMessageObserver(observer MessageObserver) LoopOption {
 
 // observe 把一条刚产生的消息交给观察者。传入的是消息序列里的同一份消息，
 // 观察者只读。
-func (l *Loop) observe(message *schema.Message) {
+func (l *Loop) observe(message schema.Message) {
 	if l.onMessage == nil {
 		return
 	}
@@ -110,7 +110,7 @@ func (l *Loop) definitions() schema.ToolDefinitions {
 // 中途出错，返回值也包含已经产生的部分，便于上层排查。
 func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, error) {
 	state := &runState{
-		contextHistory: append([]*schema.Message(nil), runContext.Messages...),
+		contextHistory: append([]schema.Message(nil), runContext.Messages...),
 		availableTools: append(schema.ToolDefinitions(nil), runContext.Tools...),
 	}
 	state.messages = append(schema.Messages(nil), state.contextHistory...)
@@ -128,29 +128,44 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 		if err != nil {
 			return state.messages, err
 		}
+		// 这一轮的模型消息必须是助手消息：交回 nil 接口或别的具体类型都说明流
+		// 实现破坏了契约。这里必须报内部错误——按"没有工具调用"处理会让一次
+		// 坏掉的响应看起来像正常收尾，循环静默结束。
+		assistant, ok := message.(*schema.AssistantMessage)
+		if !ok {
+			return state.messages, pierrors.ErrInternal.Wrap(fmt.Errorf(
+				"模型响应不是助手消息: %T", message))
+		}
 		// 模型消息先入列：工具结果必须紧跟在发起调用的那条助手消息之后，
 		// 两家协议都按这个顺序还原上下文。
 		state.messages = append(state.messages, message)
 		l.observe(message)
 
-		if len(message.ToolCalls) == 0 {
+		if len(assistant.ToolCalls) == 0 {
 			return state.messages, nil
 		}
 		if l.scheduler == nil {
 			return state.messages, pierrors.ErrInternal.Wrap(fmt.Errorf(
-				"模型请求调用工具 %q，但本轮运行没有接入工具调度器", message.ToolCalls[0].Name))
+				"模型请求调用工具 %q，但本轮运行没有接入工具调度器", assistant.ToolCalls[0].Name))
 		}
 
-		results, err := l.scheduler.ExecuteBatch(ctx, message.ToolCalls)
+		results, err := l.scheduler.ExecuteBatch(ctx, assistant.ToolCalls)
 		if err != nil {
 			return state.messages, err
 		}
 		for index := range results {
 			// 工具自身的失败同样作为一条 IsError 的工具消息回给模型，
 			// 让模型自己决定重试还是换条路；只有调度层面的失败才中断。
-			result := results[index].ResultMessage()
-			state.messages = append(state.messages, &result)
-			l.observe(&result)
+			result, err := results[index].ResultMessage()
+			if err != nil {
+				// 结束事件缺身份是调度器坏了，不是工具失败：工具失败会以
+				// IsError 事件表达，不会走到这里。
+				return state.messages, pierrors.ErrInternal.Wrap(err)
+			}
+			// 追加的是消息值本身：取一条复用变量的地址会让序列里的每条工具结果
+			// 都指向同一份内存。
+			state.messages = append(state.messages, result)
+			l.observe(result)
 		}
 	}
 }
@@ -159,7 +174,7 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 //
 // Stream 是拉取式的：Result() 要等流读到结束才有效（结果与错误都在那条路径
 // 上产生），所以这里必须一直 Next() 到返回 false。
-func (l *Loop) complete(ctx context.Context, state *runState) (*schema.Message, error) {
+func (l *Loop) complete(ctx context.Context, state *runState) (schema.Message, error) {
 	stream := l.provider.Stream(ctx, state.messages, state.availableTools)
 	defer stream.Close()
 
