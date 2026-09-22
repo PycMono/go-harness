@@ -76,7 +76,7 @@ func (m Messages) ToOpenAIMessages() ([]openaisdk.ChatCompletionMessageParamUnio
 			}
 			result = append(result, user)
 		case *ToolResultMessage:
-			text, err := typed.Content.Text()
+			text, err := openAIToolResultText(typed.Content)
 			if err != nil {
 				return nil, err
 			}
@@ -130,12 +130,16 @@ func (m Messages) ToAnthropicMessages() ([]anthropicsdk.MessageParam, []anthropi
 			}
 			result = append(result, anthropicsdk.NewUserMessage(blocks...))
 		case *ToolResultMessage:
-			text, err := typed.Content.Text()
+			content, err := anthropicToolResultContent(typed.Content)
 			if err != nil {
 				return nil, nil, err
 			}
 			result = append(result, anthropicsdk.NewUserMessage(
-				anthropicsdk.NewToolResultBlock(typed.ToolCallID, text, typed.IsError),
+				anthropicsdk.ContentBlockParamUnion{OfToolResult: &anthropicsdk.ToolResultBlockParam{
+					ToolUseID: typed.ToolCallID,
+					IsError:   anthropicsdk.Bool(typed.IsError),
+					Content:   content,
+				}},
 			))
 		case *AssistantMessage:
 			text, err := typed.Content.Text()
@@ -195,6 +199,91 @@ func (m *UserMessage) toOpenAIUserMessage() (openaisdk.ChatCompletionMessagePara
 	}
 
 	return openaisdk.UserMessage(parts), nil
+}
+
+// openAIToolResultText 选出 OpenAI tool 消息的文本内容。OpenAI 的 tool 消息只有
+// 文本位置，图片进不去，所以这条路径必须降级而不是报错。选词照搬 pi.dev 的三路
+// 规则（openai-completions.ts:1409-1410）：有文本用文本（拼接口径与
+// Content.Text() 一致）、没有文本但有图片用 "(see attached image)"、两者都没有用
+// "(no tool output)"。后两个字符串是字面量，与脱敏占位 ImagePlaceholderText 无
+// 关——那是摘要与日志路径的词，不进 tool 消息。
+func openAIToolResultText(blocks ContentBlocks) (string, error) {
+	var text strings.Builder
+	hasImage := false
+	for _, block := range blocks {
+		switch block.Type {
+		case ContentTypeText:
+			text.WriteString(block.Text)
+		case ContentTypeImage:
+			// 图片本身不进入 tool 消息，但缺 Image 的脏块要和别处一样被拒。
+			if _, err := toolResultImageURL(block); err != nil {
+				return "", err
+			}
+			hasImage = true
+		default:
+			return "", fmt.Errorf("unsupported content type %q", block.Type)
+		}
+	}
+
+	switch {
+	case text.Len() > 0:
+		return text.String(), nil
+	case hasImage:
+		return "(see attached image)", nil
+	default:
+		return "(no tool output)", nil
+	}
+}
+
+// anthropicToolResultContent 把工具结果的内容块投影成 tool_result 的内容成员：
+// 文本合成一个 text 成员，图片成员按内容顺序排在它后面。Anthropic 的 tool_result
+// 本身就接受图片成员（ToolResultBlockParamContentUnion.OfImage），所以这条路径不
+// 降级、不丢图。内容为空时保留一个空 text 成员，与旧的 NewToolResultBlock 产物
+// 逐字段一致。
+func anthropicToolResultContent(
+	blocks ContentBlocks,
+) ([]anthropicsdk.ToolResultBlockParamContentUnion, error) {
+	var text strings.Builder
+	images := make([]anthropicsdk.ToolResultBlockParamContentUnion, 0, len(blocks))
+	for _, block := range blocks {
+		switch block.Type {
+		case ContentTypeText:
+			text.WriteString(block.Text)
+		case ContentTypeImage:
+			imageURL, err := toolResultImageURL(block)
+			if err != nil {
+				return nil, err
+			}
+			images = append(images, anthropicsdk.ToolResultBlockParamContentUnion{
+				OfImage: &anthropicsdk.ImageBlockParam{
+					Source: anthropicsdk.ImageBlockParamSourceUnion{
+						OfURL: &anthropicsdk.URLImageSourceParam{URL: imageURL},
+					},
+				},
+			})
+		default:
+			return nil, fmt.Errorf("unsupported content type %q", block.Type)
+		}
+	}
+
+	// 纯图片结果不塞空文本成员；其余情况（含空结果）都把文本成员放在最前面。
+	if text.Len() == 0 && len(images) > 0 {
+		return images, nil
+	}
+
+	return append([]anthropicsdk.ToolResultBlockParamContentUnion{
+		{OfText: &anthropicsdk.TextBlockParam{Text: text.String()}},
+	}, images...), nil
+}
+
+// toolResultImageURL 取图片块的 URL；缺 Image 的脏块按内容块校验的措辞报错。
+// 图片投影的两条路径都要挡住它，避免取 URL 时 panic。
+func toolResultImageURL(block ContentBlock) (string, error) {
+	if block.Image == nil {
+		return "", fmt.Errorf("image block requires image content")
+	}
+
+	return block.Image.URL, nil
 }
 
 // ContentType 表示消息内容块的类型。
