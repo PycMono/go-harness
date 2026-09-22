@@ -235,26 +235,60 @@ func openAIToolResultText(blocks ContentBlocks) (string, error) {
 	}
 }
 
-// anthropicToolResultContent 把工具结果的内容块投影成 tool_result 的内容成员：
-// 文本合成一个 text 成员，图片成员按内容顺序排在它后面。Anthropic 的 tool_result
-// 本身就接受图片成员（ToolResultBlockParamContentUnion.OfImage），所以这条路径不
-// 降级、不丢图。内容为空时保留一个空 text 成员，与旧的 NewToolResultBlock 产物
-// 逐字段一致。
+// anthropicToolResultContent 把工具结果的内容块投影成 tool_result 的内容成员，形状
+// 对齐 pi.dev 的 convertContentBlocks（anthropic-messages.ts:128-176），三种情况：
+//
+//   - 没有图片块：全部文本块按顺序拼成一个 text 成员（拼接口径与 Content.Text() 一致，
+//     不带分隔符）。空内容也保留这一个空 text 成员，与旧的 NewToolResultBlock 产物
+//     逐字段一致。
+//   - 有图片块：按内容顺序每个块各自成一个成员——文本块不合并，排在图片之后的文本块
+//     也不会被挪到图片前面，内容顺序原样保留。
+//   - 有图片块但没有文本块：在最前面补一个 "(see attached image)" 文本成员，作为图片的
+//     锚点，不发出没有文本锚点的裸图片 content。判据是"有没有文本块"，空文本块照样算。
+//
+// Anthropic 的 tool_result 本身就接受图片成员（ToolResultBlockParamContentUnion.OfImage），
+// 所以这条路径不降级、不丢图。两种分支都拒绝未知块类型，没有图片时也不会静默吞掉脏块。
 func anthropicToolResultContent(
 	blocks ContentBlocks,
 ) ([]anthropicsdk.ToolResultBlockParamContentUnion, error) {
-	var text strings.Builder
-	images := make([]anthropicsdk.ToolResultBlockParamContentUnion, 0, len(blocks))
+	hasImage := false
+	for _, block := range blocks {
+		if block.Type == ContentTypeImage {
+			hasImage = true
+			break
+		}
+	}
+
+	if !hasImage {
+		var text strings.Builder
+		for _, block := range blocks {
+			switch block.Type {
+			case ContentTypeText:
+				text.WriteString(block.Text)
+			default:
+				return nil, fmt.Errorf("unsupported content type %q", block.Type)
+			}
+		}
+		return []anthropicsdk.ToolResultBlockParamContentUnion{
+			{OfText: &anthropicsdk.TextBlockParam{Text: text.String()}},
+		}, nil
+	}
+
+	content := make([]anthropicsdk.ToolResultBlockParamContentUnion, 0, len(blocks)+1)
+	hasText := false
 	for _, block := range blocks {
 		switch block.Type {
 		case ContentTypeText:
-			text.WriteString(block.Text)
+			hasText = true
+			content = append(content, anthropicsdk.ToolResultBlockParamContentUnion{
+				OfText: &anthropicsdk.TextBlockParam{Text: block.Text},
+			})
 		case ContentTypeImage:
 			imageURL, err := toolResultImageURL(block)
 			if err != nil {
 				return nil, err
 			}
-			images = append(images, anthropicsdk.ToolResultBlockParamContentUnion{
+			content = append(content, anthropicsdk.ToolResultBlockParamContentUnion{
 				OfImage: &anthropicsdk.ImageBlockParam{
 					Source: anthropicsdk.ImageBlockParamSourceUnion{
 						OfURL: &anthropicsdk.URLImageSourceParam{URL: imageURL},
@@ -266,14 +300,13 @@ func anthropicToolResultContent(
 		}
 	}
 
-	// 纯图片结果不塞空文本成员；其余情况（含空结果）都把文本成员放在最前面。
-	if text.Len() == 0 && len(images) > 0 {
-		return images, nil
+	if !hasText {
+		content = append([]anthropicsdk.ToolResultBlockParamContentUnion{
+			{OfText: &anthropicsdk.TextBlockParam{Text: "(see attached image)"}},
+		}, content...)
 	}
 
-	return append([]anthropicsdk.ToolResultBlockParamContentUnion{
-		{OfText: &anthropicsdk.TextBlockParam{Text: text.String()}},
-	}, images...), nil
+	return content, nil
 }
 
 // toolResultImageURL 取图片块的 URL；缺 Image 的脏块按内容块校验的措辞报错。

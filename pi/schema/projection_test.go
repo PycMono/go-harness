@@ -12,7 +12,8 @@ import (
 // 本文件钉住任务三的文本投影规则：
 //   - Content.Text() 保持严格，遇到图片块报错——只有真正需要纯文本的调用方能用它；
 //   - 工具结果到 Anthropic 时图片原样进 tool_result（该协议支持多模态工具结果），
-//     不做占位降级；
+//     不做占位降级；没有图片时全部文本合成一个 text 成员，有图片时每个内容块各自成
+//     一个成员且保持内容顺序，纯图片结果在图片前补一个锚点文本；
 //   - 工具结果到 OpenAI 时只出文本，选词按 pi.dev 的三路规则（有文本用文本、无文本
 //     有图片用固定英文占位、都没有用另一个固定占位）。
 
@@ -109,7 +110,7 @@ func TestWithImagePlaceholdersRedactsImages(t *testing.T) {
 }
 
 // TestToAnthropicToolResultCarriesImages 钉住 Anthropic 侧 tool_result 的多模态
-// 内容：一个 text 成员在前、图片成员按内容顺序在后，ToolUseID 与 IsError 不变。
+// 内容：文本成员与图片成员按内容顺序排列，ToolUseID 与 IsError 不变。
 func TestToAnthropicToolResultCarriesImages(t *testing.T) {
 	block := projectionAnthropicToolResult(t, &ToolResultMessage{
 		Content:    ContentBlocks{TextBlock(projectionToolText), ImageBlock(projectionToolImage)},
@@ -123,66 +124,83 @@ func TestToAnthropicToolResultCarriesImages(t *testing.T) {
 		t.Fatalf("is_error = %v (valid=%v)，想要 true", block.IsError.Value, block.IsError.Valid())
 	}
 
-	content := block.Content
-	if len(content) != 2 {
-		t.Fatalf("tool_result 内容成员数 = %d，想要 2: %+v", len(content), content)
-	}
-	if content[0].OfText == nil || content[0].OfText.Text != projectionToolText {
-		t.Fatalf("content[0] = %+v，想要文本成员 %q", content[0], projectionToolText)
-	}
-	if content[0].OfImage != nil {
-		t.Fatalf("content[0] 同时填了 image: %+v", content[0].OfImage)
-	}
-	if content[1].OfImage == nil {
-		t.Fatalf("content[1] 不是 image 成员: %+v", content[1])
-	}
-	if content[1].OfImage.Source.OfURL == nil ||
-		content[1].OfImage.Source.OfURL.URL != projectionToolImage {
-		t.Fatalf("content[1] 图片 source = %+v，想要 URL %q",
-			content[1].OfImage.Source, projectionToolImage)
-	}
-	if content[1].OfImage.Source.OfBase64 != nil {
-		t.Fatalf("content[1] 同时填了 base64 source: %+v", content[1].OfImage.Source.OfBase64)
-	}
-	if content[1].OfText != nil {
-		t.Fatalf("content[1] 同时填了 text: %+v", content[1].OfText)
-	}
-}
-
-// TestToAnthropicToolResultConcatenatesTextBlocks 钉住文本投影的口径：多个文本块
-// 合成一个 text 成员（与 Content.Text() 的拼接一致），图片成员一律排在其后。
-func TestToAnthropicToolResultConcatenatesTextBlocks(t *testing.T) {
-	block := projectionAnthropicToolResult(t, &ToolResultMessage{
-		Content: ContentBlocks{
-			TextBlock("前"), ImageBlock(projectionToolImage), TextBlock("后"),
-		},
-		ToolCallID: projectionToolID, ToolName: "read_file",
+	projectionAssertContent(t, block.Content, []projectionContentMember{
+		{text: projectionToolText},
+		{image: projectionToolImage},
 	})
+}
 
-	if len(block.Content) != 2 {
-		t.Fatalf("tool_result 内容成员数 = %d，想要 2: %+v", len(block.Content), block.Content)
+// TestToAnthropicToolResultPreservesBlockOrder 钉住有图片时 tool_result 的成员顺序：
+// 每个内容块各自成一个成员，按内容顺序排列——文本块不合并，排在图片之后的文本块也不
+// 会被挪到图片前面。判据照搬 pi.dev 的 convertContentBlocks（anthropic-messages.ts:148-163）：
+// 只要内容里有图片块就逐块映射；有文本块就不补锚点，空文本块也算"有文本块"。
+func TestToAnthropicToolResultPreservesBlockOrder(t *testing.T) {
+	cases := []struct {
+		name    string
+		content ContentBlocks
+		want    []projectionContentMember
+	}{
+		{
+			name:    "文本 + 图片 + 文本",
+			content: ContentBlocks{TextBlock("前"), ImageBlock(projectionToolImage), TextBlock("后")},
+			want: []projectionContentMember{
+				{text: "前"},
+				{image: projectionToolImage},
+				{text: "后"},
+			},
+		},
+		{
+			name:    "空文本块也算有文本块，不补锚点",
+			content: ContentBlocks{TextBlock(""), ImageBlock(projectionToolImage)},
+			want: []projectionContentMember{
+				{text: ""},
+				{image: projectionToolImage},
+			},
+		},
 	}
-	if block.Content[0].OfText == nil || block.Content[0].OfText.Text != "前后" {
-		t.Fatalf("content[0] = %+v，想要拼接文本 %q", block.Content[0], "前后")
-	}
-	if block.Content[1].OfImage == nil {
-		t.Fatalf("content[1] 不是 image 成员: %+v", block.Content[1])
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			block := projectionAnthropicToolResult(t, &ToolResultMessage{
+				Content:    testCase.content,
+				ToolCallID: projectionToolID, ToolName: "read_file",
+			})
+
+			projectionAssertContent(t, block.Content, testCase.want)
+		})
 	}
 }
 
-// TestToAnthropicImageOnlyToolResult 钉住纯图片工具结果：只出图片成员，不塞空的
-// 文本成员。
+// TestToAnthropicImageOnlyToolResult 钉住纯图片工具结果：图片成员前补一个锚点文本成员
+// （pi.dev 在 anthropic-messages.ts:165-169 补的 "(see attached image)"），不发出没有
+// 文本锚点的裸图片 content。
 func TestToAnthropicImageOnlyToolResult(t *testing.T) {
 	block := projectionAnthropicToolResult(t, &ToolResultMessage{
 		Content:    ContentBlocks{ImageBlock(projectionToolImage)},
 		ToolCallID: projectionToolID, ToolName: "read_file",
 	})
 
-	if len(block.Content) != 1 {
-		t.Fatalf("tool_result 内容成员数 = %d，想要 1: %+v", len(block.Content), block.Content)
+	projectionAssertContent(t, block.Content, []projectionContentMember{
+		{text: "(see attached image)"},
+		{image: projectionToolImage},
+	})
+}
+
+// TestToAnthropicMultiTextToolResultUnchanged 钉住没有图片时的多文本块仍是逐字节一致的
+// 旧形状：全部文本块按顺序拼成一个 text 成员，整块（含未导出字段）与旧路径
+// NewToolResultBlock 的产物 DeepEqual。
+func TestToAnthropicMultiTextToolResultUnchanged(t *testing.T) {
+	block := projectionAnthropicToolResult(t, &ToolResultMessage{
+		Content:    ContentBlocks{TextBlock("前"), TextBlock("后")},
+		ToolCallID: projectionToolID, ToolName: "read_file", IsError: true,
+	})
+
+	want := anthropicsdk.NewToolResultBlock(projectionToolID, "前后", true)
+	if want.OfToolResult == nil {
+		t.Fatal("旧路径构造失败")
 	}
-	if block.Content[0].OfImage == nil || block.Content[0].OfText != nil {
-		t.Fatalf("content[0] = %+v，想要纯图片成员", block.Content[0])
+	if !reflect.DeepEqual(*block, *want.OfToolResult) {
+		t.Fatalf("tool_result = %+v，想要与旧路径逐字段一致: %+v", *block, *want.OfToolResult)
 	}
 }
 
@@ -343,8 +361,50 @@ func TestToolResultImageBlockWithoutImageFails(t *testing.T) {
 	if _, err := messages.ToOpenAIMessages(); err == nil {
 		t.Fatal("ToOpenAIMessages 对缺 Image 的图片块没有报错")
 	}
-	if _, _, err := messages.ToAnthropicMessages(); err == nil {
+	_, _, err := messages.ToAnthropicMessages()
+	if err == nil {
 		t.Fatal("ToAnthropicMessages 对缺 Image 的图片块没有报错")
+	}
+	const wantMessage = "image block requires image content"
+	if !strings.Contains(err.Error(), wantMessage) {
+		t.Fatalf("ToAnthropicMessages 报错 = %q，想要包含 %q", err, wantMessage)
+	}
+}
+
+// TestAnthropicToolResultRejectsUnknownBlockTypes 钉住未知块类型在 Anthropic 工具结果
+// 的两条分支上都报错：没有图片时不能因为"只拼文本"就把来路不明的块静默吞掉。
+func TestAnthropicToolResultRejectsUnknownBlockTypes(t *testing.T) {
+	cases := []struct {
+		name    string
+		content ContentBlocks
+	}{
+		{
+			name:    "无图片",
+			content: ContentBlocks{TextBlock(projectionToolText), {Type: ContentType("audio")}},
+		},
+		{
+			name: "有图片",
+			content: ContentBlocks{
+				TextBlock(projectionToolText), ImageBlock(projectionToolImage),
+				{Type: ContentType("audio")},
+			},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, _, err := Messages{&ToolResultMessage{
+				Content:    testCase.content,
+				ToolCallID: projectionToolID, ToolName: "read_file",
+			}}.ToAnthropicMessages()
+			if err == nil {
+				t.Fatal("ToAnthropicMessages 对未知块类型没有报错")
+			}
+			const wantMessage = `unsupported content type "audio"`
+			if !strings.Contains(err.Error(), wantMessage) {
+				t.Fatalf("ToAnthropicMessages 报错 = %q，想要包含 %q", err, wantMessage)
+			}
+		})
 	}
 }
 
@@ -376,4 +436,51 @@ func projectionAnthropicToolResult(
 	}
 
 	return block
+}
+
+// projectionContentMember 描述 tool_result 里一个期望的内容成员：文本成员填 text，
+// URL 图片成员填 image，两者恰好填一个（空文本成员靠 image 为空来区分）。
+type projectionContentMember struct {
+	text  string
+	image string
+}
+
+// projectionAssertContent 逐成员断言 tool_result 的内容：成员数量、顺序、每个成员的类型
+// 与取值，以及每个成员只填联合类型的一个分支。
+func projectionAssertContent(
+	t *testing.T,
+	content []anthropicsdk.ToolResultBlockParamContentUnion,
+	want []projectionContentMember,
+) {
+	t.Helper()
+
+	if len(content) != len(want) {
+		t.Fatalf("tool_result 内容成员数 = %d，想要 %d: %+v", len(content), len(want), content)
+	}
+	for index, member := range content {
+		if want[index].image != "" {
+			if member.OfImage == nil {
+				t.Fatalf("content[%d] 不是 image 成员: %+v", index, member)
+			}
+			if member.OfImage.Source.OfURL == nil ||
+				member.OfImage.Source.OfURL.URL != want[index].image {
+				t.Fatalf("content[%d] 图片 source = %+v，想要 URL %q",
+					index, member.OfImage.Source, want[index].image)
+			}
+			if member.OfImage.Source.OfBase64 != nil {
+				t.Fatalf("content[%d] 同时填了 base64 source: %+v",
+					index, member.OfImage.Source.OfBase64)
+			}
+			if member.OfText != nil {
+				t.Fatalf("content[%d] 同时填了 text: %+v", index, member.OfText)
+			}
+			continue
+		}
+		if member.OfText == nil || member.OfText.Text != want[index].text {
+			t.Fatalf("content[%d] = %+v，想要文本成员 %q", index, member, want[index].text)
+		}
+		if member.OfImage != nil {
+			t.Fatalf("content[%d] 同时填了 image: %+v", index, member.OfImage)
+		}
+	}
 }
