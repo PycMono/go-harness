@@ -49,12 +49,15 @@ func (c *ContextBuilder) Build(
 	// 处理消息
 	messages := make([]*schema.Message, 0, 2+len(contextBlocks)+len(history))
 	messages = append(messages, append([]*schema.Message(nil), history...)...)
+	// 本轮输入落在历史之后，压缩要按这个下标认出"客户这次说了什么"。
+	currentInputIndex := len(messages)
 	messages = append(messages, input)
 	messages = append(messages, systemMessage)
 
+	// 排的是副本：Priority 决定注入顺序，但不该改写调用方传进来的切片。
 	blocks := append([]*ContextBlock(nil), contextBlocks...)
-	sort.SliceStable(contextBlocks, func(i, j int) bool {
-		return contextBlocks[i].Priority > contextBlocks[j].Priority
+	sort.SliceStable(blocks, func(i, j int) bool {
+		return blocks[i].Priority > blocks[j].Priority
 	})
 	for _, block := range blocks {
 		messages = append(messages, &schema.Message{
@@ -68,6 +71,6 @@ func (c *ContextBuilder) Build(
 	return &Context{
 		Messages:          messages,
 		Tools:             append(schema.ToolDefinitions(nil), definitions...),
-		CurrentInputIndex: len(messages) - 1,
+		CurrentInputIndex: currentInputIndex,
 	}, nil
 }

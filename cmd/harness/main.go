@@ -13,6 +13,7 @@ import (
 	"github.com/PycMono/go-harness/pi"
 	"github.com/PycMono/go-harness/pi/ai/providers"
 	"github.com/PycMono/go-harness/pi/schema"
+	"github.com/PycMono/go-harness/pi/session"
 	"github.com/PycMono/go-harness/pi/tools"
 )
 
@@ -116,6 +117,7 @@ func main() {
 		Observer:        observe,
 		TextObserver:    printDelta,
 		MaxTurns:        *maxTurns,
+		Session:         session.InMemory(),
 	})
 	if err != nil {
 		fail(err)

@@ -154,6 +154,9 @@ type ToolOutput struct {
 	Details any `json:"details,omitempty"`
 }
 
+// UpdateEmitter receives incremental updates from a running tool.
+type UpdateEmitter func(ToolUpdate)
+
 // ToolUpdate 是工具执行过程中的一次增量返回值。
 type ToolUpdate struct {
 	// Content 是本次增量返回的内容块。

@@ -31,3 +31,6 @@ go.work.sum
 .idea/
 # .vscode/
 config.json
+
+# cmd/sessiontest 默认把会话文件落在这里
+/testdata/

@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 
@@ -21,16 +20,20 @@ type Scheduler struct {
 	registry    *Registry
 	maxParallel int
 	emit        EventObserver
+	handlers    []Handler
 }
 
 // NewScheduler 构造工具调度器。emit 接收执行过程中的生命周期事件（开始与增量），
 // 可为 nil 表示丢弃；它在整个 Scheduler 生命周期内固定，且会被并发调用，实现须
-// 自行保证并发安全。
-func NewScheduler(registry *Registry, maxParallel int, emit EventObserver) *Scheduler {
+// 自行保证并发安全。handlers 是中间件执行链，可为空（只跑真实工具调用），
+// 链由装配处注入（见 pi/middleware 的 Defaults）；切片顺序即执行顺序，
+// Scheduler 不持有所有权，调用方不得在运行期间修改。
+func NewScheduler(registry *Registry, maxParallel int, emit EventObserver, handlers ...Handler) *Scheduler {
 	return &Scheduler{
 		registry:    registry,
 		maxParallel: maxParallel,
 		emit:        emit,
+		handlers:    handlers,
 	}
 }
 
@@ -68,7 +71,9 @@ func (s *Scheduler) ExecuteBatch(ctx context.Context, calls schema.ToolCalls) ([
 // 本次调用的结束事件；工具自身的失败以 IsError 结束事件表达，返回的 error 只用于
 // 调度器无法执行的情况（上下文已取消）。
 //
-// 参数先按工具自己的 JSON Schema 校验，非法参数不进入工具实现。
+// 参数先按工具自己的 JSON Schema 校验，非法参数不进入工具实现。查表与校验
+// 失败直接合成拒绝事件，不经过中间件链；通过后构造 Execution 跑链，链尾
+// 的终端 handler 执行真实工具调用（见 execution.go）。
 func (s *Scheduler) Execute(ctx context.Context, call schema.ToolCall) (Event, error) {
 	if err := ctx.Err(); err != nil {
 		return Event{}, err
@@ -92,19 +97,27 @@ func (s *Scheduler) Execute(ctx context.Context, call schema.ToolCall) (Event, e
 
 	// 工具执行期间的增量更新转成增量事件送出；emit 为 nil 时静默丢弃，
 	// 但 emitter 始终非 nil，避免工具实现额外做空指针判断。
-	output, err := toolEntry.tool.Execute(ctx, call.Arguments, new(UpdateEmitter(func(update schema.ToolUpdate) {
+	execution := Execution{
+		Ctx:          ctx,
+		Call:         call,
+		Definition:   toolEntry.definition,
+		Tool:         toolEntry.tool,
+		ValidateArgs: toolEntry.validateArgs,
+	}
+	emitter := UpdateEmitter(func(update schema.ToolUpdate) {
 		if s.emit != nil {
 			s.emit(NewUpdateEvent(call, update))
 		}
-	})))
-	if err != nil {
-		return NewErrorEvent(call, err), nil
-	}
-	if output == nil {
-		return NewErrorEvent(call, pierrors.ErrToolPanic.Wrap(errors.New("tool returned nil output"))), nil
+	})
+	execution.Emit = &emitter
+
+	execution.Run(s.handlers)
+
+	if execution.Err != nil {
+		return NewErrorEvent(call, execution.Err), nil
 	}
 
-	return NewEndEvent(call, *output, false, 0), nil
+	return NewEndEvent(call, execution.Output, false, 0), nil
 }
 
 // executeWave 并发执行 calls[start:end)，结束事件按下标写回 results。

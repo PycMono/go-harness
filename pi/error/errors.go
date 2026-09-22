@@ -126,6 +126,25 @@ var (
 	ErrSkillShadowed                = New(70015, "Skill 被更高优先级来源覆盖")
 	ErrSkillModelInvocationDisabled = New(70016, "Skill 已禁止模型调用")
 
+	// Session 会话持久化（80000–80099）：会话文件读写。
+	ErrSessionFileInvalid    = New(80000, "会话文件损坏或缺少 header")
+	ErrSessionAppendFailed   = New(80001, "会话追加写入失败")
+	ErrSessionParentMismatch = New(80002, "会话写入乱序：ParentID 不是当前叶子")
+	ErrSessionNotFound       = New(80003, "会话文件不存在")
+	ErrSessionAlreadyExists  = New(80011, "会话文件已存在")
+
+	// 上面四个答"哪个环节"，下面这些答"为什么"：原因码挂在环境码的 cause 上，
+	// CodeOf 取环境码（调用方按它分流），errors.Is 问具体原因（日志与断言用）。
+	ErrSessionFileEmpty             = New(80004, "会话文件为空")
+	ErrSessionHeaderLineInvalid     = New(80005, "会话首行不是合法 JSON")
+	ErrSessionHeaderTypeInvalid     = New(80006, "会话首行不是 session entry")
+	ErrSessionEntryIDMissing        = New(80007, "entry id 不能为空")
+	ErrSessionHeaderPayloadMissing  = New(80008, "header entry 缺少 header 载荷")
+	ErrSessionMessagePayloadMissing = New(80009, "message entry 缺少 message 载荷")
+	ErrSessionEntryTypeUnsupported  = New(80010, "entry 类型不受支持")
+	ErrSessionHeaderNotAppendable   = New(80012, "header 只能由 Create 写入")
+	ErrSessionWorkDirMismatch       = New(80013, "会话文件不属于该工作区")
+
 	ErrWorkDirRequired      = New(10004, "workDir 不能为空")
 	ErrWorkDirUnopenable    = New(10005, "工作区目录无法打开")
 	ErrAgentsFileMissing    = New(10006, "AGENTS.md 不存在")
@@ -134,6 +153,16 @@ var (
 	ErrAgentsFileTooLarge   = New(10009, "AGENTS.md 超过 1 MiB")
 	ErrAgentsFileNotUTF8    = New(10010, "AGENTS.md 不是有效的 UTF-8 文本")
 	ErrAgentsFileEmpty      = New(10011, "AGENTS.md 不能为空")
+
+	// ErrSessionsRootRequired 是会话存储的根目录（session.OpenOrCreate 的第一个参数），
+	// 与 ErrWorkDirRequired 同类：装配期必填的路径参数，直接返回不带 cause。
+	ErrSessionsRootRequired = New(10012, "sessions 根目录不能为空")
+
+	// 会话 id 也归这一段而不是 80000 段：它是调用方给的参数，在任何文件被碰到
+	// 之前就该拒掉。放这里还有个作用——id 会变成文件名，非法字符必须在这道闸上
+	// 拦下（../evil 这种），不能等到打开文件时才发现。
+	ErrSessionIDRequired = New(10013, "会话 id 不能为空")
+	ErrSessionIDInvalid  = New(10014, "会话 id 不合法：只允许字母数字与 - _ .，首尾必须是字母数字")
 
 	// ErrInternal 内部
 	ErrInternal = New(90000, "内部错误")

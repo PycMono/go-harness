@@ -3,7 +3,7 @@
 内置默认工具集与工具执行域。
 
 - 工具注册生命周期：`Registry` 管理工具的注册与查找。
-- 执行：`Scheduler` 负责单次调用与批量调度，参数先按工具自己的 JSON Schema 校验；`Event` 表达执行生命周期。中间件链（`pi/middleware`）尚未实现。
+- 执行：`Scheduler` 负责单次调用与批量调度，参数先按工具自己的 JSON Schema 校验；`Event` 表达执行生命周期。中间件契约在 `execution.go`（`Handler` / `Execution`），Scheduler 是链的驱动方，链尾固定接终端 handler 执行真实调用；内置 Handler 见 `pi/middleware`，由装配处注入。查表与参数校验失败不经过链。
 - 内置工具（`pi/tools/impl`）：`read`、`write`、`edit`、`bash`。待做：`ls`、`apply_patch`（含补丁解析器）。
 - 输出控制：`LimitText` 在 `schema.ToolOutput` 上做截断，策略（提示文案、额度语义、`truncated` 详情）留在本包，`pi/schema` 只约定返回值形状。当前没有调用方，内置工具尚未接上统一的字节预算。
 

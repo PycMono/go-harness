@@ -86,9 +86,9 @@ func (message Message) Message2AI() (*schema.Message, error) {
 }
 
 type RunInput struct {
-	History []*Message // History 是本轮运行开始前、面向业务的文本会话历史。
-	Input   *Message
-	Context []*ContextBlock // Context 是本轮额外注入的业务上下文。
+	Input *Message
+	// Context 是本轮额外注入的业务上下文。
+	Context []*ContextBlock
 }
 
 // ContextBlock 表示运行时注入到会话历史之前的一段业务上下文。
@@ -104,11 +104,6 @@ type ContextBlock struct {
 func (r *RunInput) Validate() error {
 	if r.Input == nil {
 		return pierrors.ErrRequestInvalid.Wrap(fmt.Errorf("run input message must not be nil"))
-	}
-	for index, message := range r.History {
-		if message == nil {
-			return pierrors.ErrRequestInvalid.Wrap(fmt.Errorf("history message %d must not be nil", index))
-		}
 	}
 	for index, block := range r.Context {
 		if strings.TrimSpace(block.Name) == "" {

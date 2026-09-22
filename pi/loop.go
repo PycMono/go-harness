@@ -29,6 +29,7 @@ type Loop struct {
 	provider  ai.Provider
 	scheduler *tools.Scheduler
 	onText    TextObserver
+	onMessage MessageObserver
 	maxTurns  int
 }
 
@@ -67,6 +68,24 @@ func WithMaxTurns(n int) LoopOption {
 			loop.maxTurns = n
 		}
 	}
+}
+
+// MessageObserver 接收循环逐条产生的模型消息与工具结果消息。
+type MessageObserver func(message *schema.Message)
+
+// WithMessageObserver 逐条接收循环产生的消息，用于会话持久化；不设置时
+// 行为不变，与 TextObserver 一样在单线程控制流中同步调用。
+func WithMessageObserver(observer MessageObserver) LoopOption {
+	return func(loop *Loop) { loop.onMessage = observer }
+}
+
+// observe 把一条刚产生的消息交给观察者。传入的是消息序列里的同一份消息，
+// 观察者只读。
+func (l *Loop) observe(message *schema.Message) {
+	if l.onMessage == nil {
+		return
+	}
+	l.onMessage(message)
 }
 
 // definitions 返回本轮可用工具的快照。注册表已按名称排好序，这里只是把值
@@ -112,6 +131,7 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 		// 模型消息先入列：工具结果必须紧跟在发起调用的那条助手消息之后，
 		// 两家协议都按这个顺序还原上下文。
 		state.messages = append(state.messages, message)
+		l.observe(message)
 
 		if len(message.ToolCalls) == 0 {
 			return state.messages, nil
@@ -130,6 +150,7 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 			// 让模型自己决定重试还是换条路；只有调度层面的失败才中断。
 			result := results[index].ResultMessage()
 			state.messages = append(state.messages, &result)
+			l.observe(&result)
 		}
 	}
 }
