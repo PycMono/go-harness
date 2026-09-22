@@ -216,8 +216,8 @@ func TestGoldenFixtureRoundTrip(t *testing.T) {
 		schema.RoleTool,
 	}
 	for index, want := range wantRoles {
-		if messages[index].Role != want {
-			t.Fatalf("messages[%d].Role = %q，想要 %q", index, messages[index].Role, want)
+		if messages[index].Role() != want {
+			t.Fatalf("messages[%d].Role = %q，想要 %q", index, messages[index].Role(), want)
 		}
 	}
 
@@ -227,23 +227,24 @@ func TestGoldenFixtureRoundTrip(t *testing.T) {
 	}
 
 	// 2：user 文本 + 图片。
-	if len(messages[1].Content) != 2 {
-		t.Fatalf("messages[1] 内容块数 = %d，想要 2", len(messages[1].Content))
+	content := goldenContentOf(t, messages[1])
+	if len(content) != 2 {
+		t.Fatalf("messages[1] 内容块数 = %d，想要 2", len(content))
 	}
 	// 带图消息取不出"整条文本"（Content.Text 遇到非文本块就报错），只能逐块看。
-	if messages[1].Content[0].Type != schema.ContentTypeText {
+	if content[0].Type != schema.ContentTypeText {
 		t.Fatalf("messages[1] 第一块类型 = %q，想要 %q",
-			messages[1].Content[0].Type, schema.ContentTypeText)
+			content[0].Type, schema.ContentTypeText)
 	}
-	if got := messages[1].Content[0].Text; got != goldenImageText {
+	if got := content[0].Text; got != goldenImageText {
 		t.Fatalf("messages[1] 文本 = %q，想要 %q", got, goldenImageText)
 	}
-	if messages[1].Content[1].Type != schema.ContentTypeImage {
+	if content[1].Type != schema.ContentTypeImage {
 		t.Fatalf("messages[1] 第二块类型 = %q，想要 %q",
-			messages[1].Content[1].Type, schema.ContentTypeImage)
+			content[1].Type, schema.ContentTypeImage)
 	}
-	if messages[1].Content[1].Image == nil || messages[1].Content[1].Image.URL != goldenImageURL {
-		t.Fatalf("messages[1] 图片块 = %+v，想要 URL %q", messages[1].Content[1].Image, goldenImageURL)
+	if content[1].Image == nil || content[1].Image.URL != goldenImageURL {
+		t.Fatalf("messages[1] 图片块 = %+v，想要 URL %q", content[1].Image, goldenImageURL)
 	}
 
 	// 3：assistant 纯文本。
@@ -255,10 +256,11 @@ func TestGoldenFixtureRoundTrip(t *testing.T) {
 	if got := goldenTextOf(t, messages[3]); got != goldenToolAskText {
 		t.Fatalf("messages[3] 文本 = %q，想要 %q", got, goldenToolAskText)
 	}
-	if len(messages[3].ToolCalls) != 1 {
-		t.Fatalf("messages[3] 工具调用数 = %d，想要 1", len(messages[3].ToolCalls))
+	toolCalls := goldenToolCallsOf(t, messages[3])
+	if len(toolCalls) != 1 {
+		t.Fatalf("messages[3] 工具调用数 = %d，想要 1", len(toolCalls))
 	}
-	call := messages[3].ToolCalls[0]
+	call := toolCalls[0]
 	if call.ID != goldenToolCallID || call.Name != goldenToolName {
 		t.Fatalf("工具调用 = %+v，想要 id=%q name=%q", call, goldenToolCallID, goldenToolName)
 	}
@@ -274,27 +276,73 @@ func TestGoldenFixtureRoundTrip(t *testing.T) {
 	if got := goldenTextOf(t, messages[4]); got != goldenToolResultText {
 		t.Fatalf("messages[4] 文本 = %q，想要 %q", got, goldenToolResultText)
 	}
-	if messages[4].ToolCallID != goldenToolCallID {
-		t.Fatalf("messages[4].ToolCallID = %q，想要 %q", messages[4].ToolCallID, goldenToolCallID)
+	toolResult := goldenToolResultOf(t, messages[4])
+	if toolResult.ToolCallID != goldenToolCallID {
+		t.Fatalf("messages[4].ToolCallID = %q，想要 %q", toolResult.ToolCallID, goldenToolCallID)
 	}
-	if messages[4].ToolName != goldenToolName {
-		t.Fatalf("messages[4].ToolName = %q，想要 %q", messages[4].ToolName, goldenToolName)
+	if toolResult.ToolName != goldenToolName {
+		t.Fatalf("messages[4].ToolName = %q，想要 %q", toolResult.ToolName, goldenToolName)
 	}
-	if !messages[4].IsError {
+	if !toolResult.IsError {
 		t.Fatalf("messages[4].IsError = false，想要 true")
 	}
 }
 
 // goldenTextOf 取出消息的纯文本内容。
-func goldenTextOf(t *testing.T, message *schema.Message) string {
+func goldenTextOf(t *testing.T, message schema.Message) string {
 	t.Helper()
 
-	text, err := message.Content.Text()
+	text, err := goldenContentOf(t, message).Text()
 	if err != nil {
-		t.Fatalf("消息 %q 的内容块取不出文本: %v", message.Role, err)
+		t.Fatalf("消息 %q 的内容块取不出文本: %v", message.Role(), err)
 	}
 
 	return text
+}
+
+// goldenContentOf 取出消息的内容块。Content 是各具体类型的字段而不是接口方法，
+// 读它只能按类型断言；本辅助函数定义在本文件里，供这一半的断言共用。
+func goldenContentOf(t *testing.T, message schema.Message) schema.ContentBlocks {
+	t.Helper()
+
+	switch typed := message.(type) {
+	case *schema.SystemMessage:
+		return typed.Content
+	case *schema.UserMessage:
+		return typed.Content
+	case *schema.AssistantMessage:
+		return typed.Content
+	case *schema.ToolResultMessage:
+		return typed.Content
+	default:
+		t.Fatalf("消息 %T 没有内容块", message)
+
+		return nil
+	}
+}
+
+// goldenToolCallsOf 取出助理消息的工具调用。
+func goldenToolCallsOf(t *testing.T, message schema.Message) schema.ToolCalls {
+	t.Helper()
+
+	assistant, ok := message.(*schema.AssistantMessage)
+	if !ok {
+		t.Fatalf("消息 %T 不是助理消息，没有工具调用", message)
+	}
+
+	return assistant.ToolCalls
+}
+
+// goldenToolResultOf 取出工具结果消息，读它的身份字段。
+func goldenToolResultOf(t *testing.T, message schema.Message) *schema.ToolResultMessage {
+	t.Helper()
+
+	result, ok := message.(*schema.ToolResultMessage)
+	if !ok {
+		t.Fatalf("消息 %T 不是工具结果消息", message)
+	}
+
+	return result
 }
 
 // readGoldenFixtureLines 按行读 fixture，丢掉空行。

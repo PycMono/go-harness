@@ -1,8 +1,9 @@
 // Package schema 定义与模型平台无关的消息、内容块、工具 Schema、用量与流事件
 // 表示，并负责到 OpenAI / Anthropic 两套协议的转换。本包不依赖 SDK 内任何
 // 其他包。文件划分：protocol.go 承载消息侧（序列、内容块、用量、事件），
-// message_variants.go 承载消息的四元联合类型及其构造与本地校验，tools.go 承载
-// 工具侧（工具 Schema 与调用参数）。
+// message_variants.go 承载消息的四元联合类型及其构造与本地校验，
+// message_json.go 承载消息的 JSON 编解码（线格式与旧结构体逐字节一致），
+// tools.go 承载工具侧（工具 Schema 与调用参数）。
 package schema
 
 import (
