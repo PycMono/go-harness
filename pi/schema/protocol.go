@@ -1,7 +1,8 @@
 // Package schema 定义与模型平台无关的消息、内容块、工具 Schema、用量与流事件
 // 表示，并负责到 OpenAI / Anthropic 两套协议的转换。本包不依赖 SDK 内任何
-// 其他包。文件划分：protocol.go 承载消息侧（消息、内容块、用量、事件），
-// tools.go 承载工具侧（工具 Schema 与调用参数）。
+// 其他包。文件划分：protocol.go 承载消息侧（序列、内容块、用量、事件），
+// message_variants.go 承载消息的四元联合类型及其构造与本地校验，tools.go 承载
+// 工具侧（工具 Schema 与调用参数）。
 package schema
 
 import (
@@ -33,43 +34,25 @@ const (
 	FinishReasonLength  FinishReason = "length"
 )
 
-// Message 表示对话上下文中传递的一条消息。
-type Message struct {
-	// Role 表示消息角色。
-	Role Role `json:"role"`
-	// Content 保存消息的内容块。
-	Content ContentBlocks `json:"content,omitempty"`
-	// Usage 保存生成当前模型消息时产生的用量信息。
-	Usage *Usage `json:"usage,omitempty"`
-	// FinishReason 保存模型结束当前响应的统一原因。
-	FinishReason FinishReason `json:"finish_reason,omitempty"`
-	// ToolCalls 保存模型请求执行的工具调用，允许同时包含多个调用。
-	ToolCalls ToolCalls `json:"tool_calls,omitempty"`
-	// ToolCallID 保存当前工具结果所对应的工具调用 ID。
-	ToolCallID string `json:"tool_call_id,omitempty"`
-	// ToolName 保存当前工具结果所对应的工具名称。
-	ToolName string `json:"tool_name,omitempty"`
-	// IsError 表示当前工具结果是否为错误结果。
-	IsError bool `json:"is_error,omitempty"`
-}
+// Messages 是一条对话消息序列，元素为 Message 联合值。
+type Messages []Message
 
-type Messages []*Message
-
-// Validate 校验整个消息序列：角色必须已知，tool 消息必须携带 ToolCallID，
-// 内容块必须合法且只允许 user 消息携带图片。Provider 在入口边界统一调用，
-// 非法输入在协议转换前拦截，避免落成平台侧的模糊错误。
+// Validate 校验整个消息序列：角色必须已知，每条消息校验自己的字段（工具结果
+// 的 tool_call_id 与 tool_name 由 ToolResultMessage.Validate 负责，图片规则由
+// 各角色自己的 Validate 负责）。Provider 在入口边界统一调用，非法输入在协议
+// 转换前拦截，避免落成平台侧的模糊错误。
 func (m Messages) Validate() error {
 	for _, message := range m {
-		switch message.Role {
+		// 封闭联合下未知角色已不可表达，这条检查保留的是"角色必须已知"的
+		// 序列级契约本身：入口不接受来路不明的角色。
+		role := message.Role()
+		switch role {
 		case RoleSystem, RoleUser, RoleAssistant, RoleTool:
 		default:
-			return fmt.Errorf("unsupported message role %q", message.Role)
+			return fmt.Errorf("unsupported message role %q", role)
 		}
-		if message.Role == RoleTool && message.ToolCallID == "" {
-			return fmt.Errorf("tool message requires tool_call_id")
-		}
-		if err := message.Content.ValidateForRole(message.Role); err != nil {
-			return fmt.Errorf("message role %q: %w", message.Role, err)
+		if err := message.Validate(); err != nil {
+			return fmt.Errorf("message role %q: %w", role, err)
 		}
 	}
 	return nil
@@ -78,27 +61,27 @@ func (m Messages) Validate() error {
 func (m Messages) ToOpenAIMessages() ([]openaisdk.ChatCompletionMessageParamUnion, error) {
 	result := make([]openaisdk.ChatCompletionMessageParamUnion, 0, len(m))
 	for _, message := range m {
-		switch message.Role {
-		case RoleSystem:
-			text, err := message.Content.Text()
+		switch typed := message.(type) {
+		case *SystemMessage:
+			text, err := typed.Content.Text()
 			if err != nil {
 				return nil, err
 			}
 			result = append(result, openaisdk.SystemMessage(text))
-		case RoleUser:
-			user, err := message.toOpenAIUserMessage()
+		case *UserMessage:
+			user, err := typed.toOpenAIUserMessage()
 			if err != nil {
 				return nil, err
 			}
 			result = append(result, user)
-		case RoleTool:
-			text, err := message.Content.Text()
+		case *ToolResultMessage:
+			text, err := typed.Content.Text()
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, openaisdk.ToolMessage(text, message.ToolCallID))
-		case RoleAssistant:
-			text, err := message.Content.Text()
+			result = append(result, openaisdk.ToolMessage(text, typed.ToolCallID))
+		case *AssistantMessage:
+			text, err := typed.Content.Text()
 			if err != nil {
 				return nil, err
 			}
@@ -106,7 +89,7 @@ func (m Messages) ToOpenAIMessages() ([]openaisdk.ChatCompletionMessageParamUnio
 			if text != "" {
 				assistant.Content = openaisdk.ChatCompletionAssistantMessageParamContentUnion{OfString: openaisdk.String(text)}
 			}
-			for _, toolCall := range message.ToolCalls {
+			for _, toolCall := range typed.ToolCalls {
 				assistant.ToolCalls = append(assistant.ToolCalls, openaisdk.ChatCompletionMessageToolCallUnionParam{
 					OfFunction: &openaisdk.ChatCompletionMessageFunctionToolCallParam{
 						ID: toolCall.ID,
@@ -127,16 +110,16 @@ func (m Messages) ToAnthropicMessages() ([]anthropicsdk.MessageParam, []anthropi
 	var system []anthropicsdk.TextBlockParam
 
 	for _, message := range m {
-		switch message.Role {
-		case RoleSystem:
-			text, err := message.Content.Text()
+		switch typed := message.(type) {
+		case *SystemMessage:
+			text, err := typed.Content.Text()
 			if err != nil {
 				return nil, nil, err
 			}
 			system = append(system, anthropicsdk.TextBlockParam{Text: text})
-		case RoleUser:
+		case *UserMessage:
 			var blocks []anthropicsdk.ContentBlockParamUnion
-			for _, block := range message.Content {
+			for _, block := range typed.Content {
 				switch block.Type {
 				case ContentTypeText:
 					blocks = append(blocks, anthropicsdk.NewTextBlock(block.Text))
@@ -145,16 +128,16 @@ func (m Messages) ToAnthropicMessages() ([]anthropicsdk.MessageParam, []anthropi
 				}
 			}
 			result = append(result, anthropicsdk.NewUserMessage(blocks...))
-		case RoleTool:
-			text, err := message.Content.Text()
+		case *ToolResultMessage:
+			text, err := typed.Content.Text()
 			if err != nil {
 				return nil, nil, err
 			}
 			result = append(result, anthropicsdk.NewUserMessage(
-				anthropicsdk.NewToolResultBlock(message.ToolCallID, text, message.IsError),
+				anthropicsdk.NewToolResultBlock(typed.ToolCallID, text, typed.IsError),
 			))
-		case RoleAssistant:
-			text, err := message.Content.Text()
+		case *AssistantMessage:
+			text, err := typed.Content.Text()
 			if err != nil {
 				return nil, nil, err
 			}
@@ -163,7 +146,7 @@ func (m Messages) ToAnthropicMessages() ([]anthropicsdk.MessageParam, []anthropi
 				blocks = append(blocks, anthropicsdk.NewTextBlock(text))
 			}
 
-			for _, toolCall := range message.ToolCalls {
+			for _, toolCall := range typed.ToolCalls {
 				var input any
 				if err = json.Unmarshal(toolCall.Arguments, &input); err != nil {
 					return nil, nil, fmt.Errorf("tool call %q arguments: %w", toolCall.ID, err)
@@ -177,7 +160,7 @@ func (m Messages) ToAnthropicMessages() ([]anthropicsdk.MessageParam, []anthropi
 }
 
 // toOpenAIUserMessage 映射 user 消息
-func (m *Message) toOpenAIUserMessage() (openaisdk.ChatCompletionMessageParamUnion, error) {
+func (m *UserMessage) toOpenAIUserMessage() (openaisdk.ChatCompletionMessageParamUnion, error) {
 	hasImage := false
 	for _, block := range m.Content {
 		if block.Type == ContentTypeImage {
@@ -292,15 +275,12 @@ func (image ImageContent) Validate() error {
 	return nil
 }
 
-// ValidateForRole validates every block and enforces that only user messages
-// may contain images.
-func (blocks ContentBlocks) ValidateForRole(role Role) error {
+// Validate 校验内容块集合里的每个块及其联合类型取值。角色的图片规则不在这里
+// 按角色分支：角色已由消息类型确定，由各具体类型的 Validate 各自附加。
+func (blocks ContentBlocks) Validate() error {
 	for _, block := range blocks {
 		if err := block.Validate(); err != nil {
 			return err
-		}
-		if block.Type == ContentTypeImage && role != RoleUser {
-			return fmt.Errorf("role %q must not carry image blocks", role)
 		}
 	}
 	return nil

@@ -33,12 +33,12 @@ const (
 func TestToOpenAIMessagesCharacterization(t *testing.T) {
 	cases := []struct {
 		name    string
-		message *Message
+		message Message
 		assert  func(t *testing.T, param openaisdk.ChatCompletionMessageParamUnion)
 	}{
 		{
 			name:    "system 文本",
-			message: &Message{Role: RoleSystem, Content: ContentBlocks{TextBlock(characterizationSystem)}},
+			message: &SystemMessage{Content: ContentBlocks{TextBlock(characterizationSystem)}},
 			assert: func(t *testing.T, param openaisdk.ChatCompletionMessageParamUnion) {
 				requireOpenAIVariant(t, param, "OfSystem")
 				content := param.OfSystem.Content
@@ -53,7 +53,7 @@ func TestToOpenAIMessagesCharacterization(t *testing.T) {
 		},
 		{
 			name:    "user 纯文本",
-			message: &Message{Role: RoleUser, Content: ContentBlocks{TextBlock(characterizationUser)}},
+			message: &UserMessage{Content: ContentBlocks{TextBlock(characterizationUser)}},
 			assert: func(t *testing.T, param openaisdk.ChatCompletionMessageParamUnion) {
 				requireOpenAIVariant(t, param, "OfUser")
 				content := param.OfUser.Content
@@ -68,7 +68,7 @@ func TestToOpenAIMessagesCharacterization(t *testing.T) {
 		},
 		{
 			name: "user 文本 + 图片",
-			message: &Message{Role: RoleUser, Content: ContentBlocks{
+			message: &UserMessage{Content: ContentBlocks{
 				TextBlock(characterizationUser),
 				ImageBlock(characterizationImageURL),
 			}},
@@ -100,7 +100,7 @@ func TestToOpenAIMessagesCharacterization(t *testing.T) {
 		},
 		{
 			name:    "assistant 纯文本",
-			message: &Message{Role: RoleAssistant, Content: ContentBlocks{TextBlock(characterizationAssistant)}},
+			message: &AssistantMessage{Content: ContentBlocks{TextBlock(characterizationAssistant)}},
 			assert: func(t *testing.T, param openaisdk.ChatCompletionMessageParamUnion) {
 				requireOpenAIVariant(t, param, "OfAssistant")
 				assistant := param.OfAssistant
@@ -115,8 +115,7 @@ func TestToOpenAIMessagesCharacterization(t *testing.T) {
 		},
 		{
 			name: "assistant 文本 + 工具调用",
-			message: &Message{
-				Role:    RoleAssistant,
+			message: &AssistantMessage{
 				Content: ContentBlocks{TextBlock(characterizationAssistant)},
 				ToolCalls: ToolCalls{{
 					ID: characterizationToolID, Name: "read_file",
@@ -155,8 +154,8 @@ func TestToOpenAIMessagesCharacterization(t *testing.T) {
 		},
 		{
 			name: "tool 结果",
-			message: &Message{
-				Role: RoleTool, Content: ContentBlocks{TextBlock(characterizationToolText)},
+			message: &ToolResultMessage{
+				Content:    ContentBlocks{TextBlock(characterizationToolText)},
 				ToolCallID: characterizationToolID, ToolName: "read_file", IsError: true,
 			},
 			assert: func(t *testing.T, param openaisdk.ChatCompletionMessageParamUnion) {
@@ -191,10 +190,10 @@ func TestToOpenAIMessagesCharacterization(t *testing.T) {
 // 联合分支上。
 func TestToOpenAIMessagesKeepsRoleOrder(t *testing.T) {
 	params, err := Messages{
-		{Role: RoleSystem, Content: ContentBlocks{TextBlock(characterizationSystem)}},
-		{Role: RoleUser, Content: ContentBlocks{TextBlock(characterizationUser)}},
-		{Role: RoleAssistant, Content: ContentBlocks{TextBlock(characterizationAssistant)}},
-		{Role: RoleTool, Content: ContentBlocks{TextBlock(characterizationToolText)}, ToolCallID: characterizationToolID},
+		&SystemMessage{Content: ContentBlocks{TextBlock(characterizationSystem)}},
+		&UserMessage{Content: ContentBlocks{TextBlock(characterizationUser)}},
+		&AssistantMessage{Content: ContentBlocks{TextBlock(characterizationAssistant)}},
+		&ToolResultMessage{Content: ContentBlocks{TextBlock(characterizationToolText)}, ToolCallID: characterizationToolID},
 	}.ToOpenAIMessages()
 	if err != nil {
 		t.Fatalf("ToOpenAIMessages: %v", err)
@@ -218,12 +217,12 @@ func TestToOpenAIMessagesKeepsRoleOrder(t *testing.T) {
 func TestToAnthropicMessagesCharacterization(t *testing.T) {
 	cases := []struct {
 		name    string
-		message *Message
+		message Message
 		assert  func(t *testing.T, messages []anthropicsdk.MessageParam, system []anthropicsdk.TextBlockParam)
 	}{
 		{
 			name:    "system 文本",
-			message: &Message{Role: RoleSystem, Content: ContentBlocks{TextBlock(characterizationSystem)}},
+			message: &SystemMessage{Content: ContentBlocks{TextBlock(characterizationSystem)}},
 			assert: func(t *testing.T, messages []anthropicsdk.MessageParam, system []anthropicsdk.TextBlockParam) {
 				if len(messages) != 0 {
 					t.Fatalf("system 不该进 messages，实际 %d 条", len(messages))
@@ -238,7 +237,7 @@ func TestToAnthropicMessagesCharacterization(t *testing.T) {
 		},
 		{
 			name:    "user 纯文本",
-			message: &Message{Role: RoleUser, Content: ContentBlocks{TextBlock(characterizationUser)}},
+			message: &UserMessage{Content: ContentBlocks{TextBlock(characterizationUser)}},
 			assert: func(t *testing.T, messages []anthropicsdk.MessageParam, system []anthropicsdk.TextBlockParam) {
 				if len(system) != 0 {
 					t.Fatalf("user 消息不该产出 system 块: %+v", system)
@@ -263,7 +262,7 @@ func TestToAnthropicMessagesCharacterization(t *testing.T) {
 		},
 		{
 			name: "user 文本 + 图片",
-			message: &Message{Role: RoleUser, Content: ContentBlocks{
+			message: &UserMessage{Content: ContentBlocks{
 				TextBlock(characterizationUser),
 				ImageBlock(characterizationImageURL),
 			}},
@@ -297,7 +296,7 @@ func TestToAnthropicMessagesCharacterization(t *testing.T) {
 		},
 		{
 			name:    "assistant 纯文本",
-			message: &Message{Role: RoleAssistant, Content: ContentBlocks{TextBlock(characterizationAssistant)}},
+			message: &AssistantMessage{Content: ContentBlocks{TextBlock(characterizationAssistant)}},
 			assert: func(t *testing.T, messages []anthropicsdk.MessageParam, system []anthropicsdk.TextBlockParam) {
 				if len(messages) != 1 {
 					t.Fatalf("messages 条数 = %d，想要 1", len(messages))
@@ -319,8 +318,7 @@ func TestToAnthropicMessagesCharacterization(t *testing.T) {
 		},
 		{
 			name: "assistant 文本 + 工具调用",
-			message: &Message{
-				Role:    RoleAssistant,
+			message: &AssistantMessage{
 				Content: ContentBlocks{TextBlock(characterizationAssistant)},
 				ToolCalls: ToolCalls{{
 					ID: characterizationToolID, Name: "read_file",
@@ -360,8 +358,8 @@ func TestToAnthropicMessagesCharacterization(t *testing.T) {
 		},
 		{
 			name: "tool 结果",
-			message: &Message{
-				Role: RoleTool, Content: ContentBlocks{TextBlock(characterizationToolText)},
+			message: &ToolResultMessage{
+				Content:    ContentBlocks{TextBlock(characterizationToolText)},
 				ToolCallID: characterizationToolID, ToolName: "read_file", IsError: true,
 			},
 			assert: func(t *testing.T, messages []anthropicsdk.MessageParam, system []anthropicsdk.TextBlockParam) {
@@ -411,10 +409,10 @@ func TestToAnthropicMessagesCharacterization(t *testing.T) {
 // 之后，其余消息的相对顺序不变。
 func TestToAnthropicMessagesKeepsOrderAroundSystem(t *testing.T) {
 	messages, system, err := Messages{
-		{Role: RoleSystem, Content: ContentBlocks{TextBlock(characterizationSystem)}},
-		{Role: RoleUser, Content: ContentBlocks{TextBlock(characterizationUser)}},
-		{Role: RoleAssistant, Content: ContentBlocks{TextBlock(characterizationAssistant)}},
-		{Role: RoleTool, Content: ContentBlocks{TextBlock(characterizationToolText)}, ToolCallID: characterizationToolID},
+		&SystemMessage{Content: ContentBlocks{TextBlock(characterizationSystem)}},
+		&UserMessage{Content: ContentBlocks{TextBlock(characterizationUser)}},
+		&AssistantMessage{Content: ContentBlocks{TextBlock(characterizationAssistant)}},
+		&ToolResultMessage{Content: ContentBlocks{TextBlock(characterizationToolText)}, ToolCallID: characterizationToolID},
 	}.ToAnthropicMessages()
 	if err != nil {
 		t.Fatalf("ToAnthropicMessages: %v", err)
