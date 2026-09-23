@@ -38,12 +38,31 @@ type Options struct {
 	// Session 是会话管理器，必填。history 只认这一个来源：本轮运行前的历史
 	// 从会话重建，本轮产生的消息逐条写回会话。只跑单轮用 session.InMemory()。
 	Session *session.Manager
+	// CompactionObserver 接收上下文压缩的结果，可为 nil 表示丢弃。
+	CompactionObserver func(CompactionEvent)
+}
+
+// CompactionEvent 报告一次压缩的结果：TokensBefore 是压缩前的上下文估算；
+// Err 为 nil 表示这次压成了，否则表示这次没压、历史原样保留。
+type CompactionEvent struct {
+	TokensBefore int64
+	Err          error
 }
 
 type Agent struct {
 	loop           *Loop
 	contextBuilder *ContextBuilder
 	session        *session.Manager
+	// provider 是本轮调模型的入口。循环用它跑主对话，agent 自己还要用它跑摘要
+	// ——摘要是一次独立、不带工具的调用。
+	provider ai.Provider
+	// window 是模型的上下文预算，装配时由 ProviderOptions.ContextWindow 算出。
+	window session.Window
+	// headLeafID 是本轮开始时的叶子：压缩只切到它之前，本轮的输入与产生的消息
+	// 都留着。每轮 Run 开头重取。
+	headLeafID string
+	// onCompaction 接收压缩结果，可为 nil。
+	onCompaction func(CompactionEvent)
 	// writeErr 是本轮会话写入失败的第一个错误。观察者在循环的控制流里同步调用，
 	// 没有返回错误的通道，错误只能先攒在这里，等 loop.run 返回后由 Run 透出；
 	// 循环在构造期建一次、观察者挂死在上面，所以这个缓冲只能落在 Agent 上，
@@ -99,14 +118,19 @@ func newAgent(provider ai.Provider, opts *Options) (*Agent, error) {
 	agent := &Agent{
 		contextBuilder: NewContextBuilder(opts.WorkDir),
 		session:        opts.Session,
+		provider:       provider,
+		window:         session.NewWindow(int64(opts.ProviderOptions.ContextWindow)),
+		onCompaction:   opts.CompactionObserver,
 	}
 	// 会话写入接在循环的逐条消息观察者上：模型消息与工具结果产生的当口就落盘，
-	// 而不是等 Run 结束后批量补写。
+	// 而不是等 Run 结束后批量补写。压缩挂在每轮的前置钩子上：它要调模型，而
+	// agent 是唯一持有 provider 的地方。
 	agent.loop = NewLoop(
 		provider,
 		WithScheduler(tools.NewScheduler(registry, maxParallel, opts.Observer, middleware.Defaults()...)),
 		WithTextObserver(opts.TextObserver),
 		WithMaxTurns(opts.MaxTurns),
+		WithBeforeTurn(agent.compactBeforeTurn),
 		WithMessageObserver(func(message schema.Message) {
 			// 已经出过错就不再往下写：一次写入失败会滚成一串，真正有用的只有第一个。
 			if agent.writeErr != nil {
@@ -127,8 +151,9 @@ func (a *Agent) Run(ctx context.Context, input *RunInput) (*RunOutput, error) {
 		return nil, err
 	}
 
-	// 一个 Run 一轮账：上一轮的写入错误不带进这一轮。
+	// 一个 Run 一轮账：上一轮的写入错误与本轮起点都不带进这一轮。
 	a.writeErr = nil
+	a.headLeafID = ""
 	runContext, err := a.prepareRunContext(ctx, input)
 	if err != nil {
 		return nil, err
@@ -160,6 +185,9 @@ func (a *Agent) prepareRunContext(ctx context.Context, input *RunInput) (*Contex
 			fmt.Errorf("input sender type must be customer"))
 	}
 
+	// 记下本轮开始时的叶子：压缩只切到它之前，本轮的输入与产生的消息都留着。
+	// 必须在追加本轮输入之前取——追加之后叶子就是本轮那条输入了。
+	a.headLeafID = a.session.LeafID()
 	history, err := a.history(inputMessage)
 	if err != nil {
 		return nil, err
@@ -168,6 +196,91 @@ func (a *Agent) prepareRunContext(ctx context.Context, input *RunInput) (*Contex
 	// 工具定义交给上下文组装：上下文负责把它们和技能、系统提示词一起排好，
 	// 循环只消费组装结果。
 	return a.contextBuilder.Build(ctx, history, inputMessage, nil, a.loop.definitions())
+}
+
+// compactBeforeTurn 是本轮的前置钩子：越过触发线就压一次，返回替换后的历史段。
+//
+// 判定用会话算出来的大小，不是自己把请求摊平了估：折叠后的历史里哪些 usage 还
+// 作数只有会话知道（边界之前的账会把已经压掉的上下文重新算回来），本轮的 Tail 与
+// Produced 作为 extra 一起递进去。
+func (a *Agent) compactBeforeTurn(ctx context.Context, turn Turn) (schema.Messages, error) {
+	if !a.window.OverLine(a.session.ContextTokens(a.headLeafID, turn.extra())) {
+		return nil, nil
+	}
+
+	plan, ok := a.session.PlanCompaction(a.window, a.headLeafID)
+	if !ok {
+		// 越过触发线但计划不成立：路径太短、末尾已经是边界、或本轮起点指不着。
+		// 不是错误。
+		return nil, nil
+	}
+
+	summary, err := a.summarize(ctx, plan)
+	if err != nil {
+		// 压不动不算这一轮失败：历史还是完整的，只是继续贴着窗口跑。
+		// 真溢出了让 provider 去报（20003），比在这里把客户的这一轮打断好。
+		a.report(CompactionEvent{TokensBefore: plan.TokensBefore, Err: err})
+
+		return nil, nil
+	}
+
+	if err = a.session.Compact(plan, summary); err != nil {
+		// 落盘失败与会话写入失败同类：盘上的历史从此缺一块，必须透出。
+		return nil, err
+	}
+	a.report(CompactionEvent{TokensBefore: plan.TokensBefore})
+
+	// 新历史从盘上折回来，不由这里拼：折叠规则只此一份，也就不会出现"计划里的
+	// 保留段与读侧折叠不一致"这种要靠人盯的分歧。上界卡在本轮开始的位置——本轮
+	// 已经产生的消息在盘上位于新边界之前，不挡住就会既进历史段、又进本轮的部分。
+	return a.session.MessagesAt(a.headLeafID), nil
+}
+
+// summarize 用当前模型生成一段摘要。这是一次独立、不带工具的调用：不进循环、
+// 不发工具描述、不接文本观察者（摘要不该流到用户屏幕上）。
+func (a *Agent) summarize(ctx context.Context, plan *session.Plan) (string, error) {
+	request, err := plan.Request(a.window)
+	if err != nil {
+		return "", pierrors.ErrCompactionFailed.Wrap(err)
+	}
+
+	stream := a.provider.Stream(ctx, request, nil)
+	defer stream.Close()
+	for stream.Next() {
+	}
+
+	response, err := stream.Result()
+	if err != nil {
+		return "", pierrors.ErrCompactionFailed.Wrap(err)
+	}
+	if response == nil {
+		return "", pierrors.ErrCompactionFailed.Wrap(errors.New("摘要请求没有产出消息"))
+	}
+	// 输出上限由 provider 写死（Anthropic 4096，anthropic.go:55），请求里指定不了。
+	// 被截断的摘要只是半段文本，拿它当检查点等于用谎言换空间。
+	if response.FinishReason == schema.FinishReasonLength {
+		return "", pierrors.ErrCompactionFailed.Wrap(errors.New("摘要被输出上限截断"))
+	}
+	if len(response.ToolCalls) > 0 {
+		return "", pierrors.ErrCompactionFailed.Wrap(errors.New("摘要请求返回了工具调用"))
+	}
+	text, err := response.Content.Text()
+	if err != nil {
+		return "", pierrors.ErrCompactionFailed.Wrap(err)
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", pierrors.ErrCompactionFailed.Wrap(errors.New("摘要为空"))
+	}
+
+	return strings.TrimSpace(text), nil
+}
+
+// report 把一次压缩结果交给观察者；没接观察者就丢弃。
+func (a *Agent) report(event CompactionEvent) {
+	if a.onCompaction == nil {
+		return
+	}
+	a.onCompaction(event)
 }
 
 // history 组装本轮的历史消息：从会话重建，并把本轮输入也交给会话记账。

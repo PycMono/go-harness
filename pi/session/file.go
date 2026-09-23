@@ -58,8 +58,12 @@ func (f *sessionFile) load() (Entries, error) {
 	if err = header.validate(); err != nil {
 		return nil, f.invalid(err)
 	}
-	if header.Header.Version != sessionVersion {
-		return nil, f.invalid(fmt.Errorf("不支持的会话文件版本 %d，当前版本为 %d", header.Header.Version, sessionVersion))
+	// 接受一段范围而不是只认当前版本：v2 文件里没有压缩边界（那种 entry 是 v3
+	// 才有的），按读侧规则读出来就是不折叠、原样重建，语义正确。只认当前版本的话
+	// 会把这份二进制发布之前建的会话全部拒之门外，而它们本来读得好好的。
+	if header.Header.Version < minReadableSessionVersion || header.Header.Version > sessionVersion {
+		return nil, f.invalid(fmt.Errorf("不支持的会话文件版本 %d，当前版本为 %d",
+			header.Header.Version, sessionVersion))
 	}
 
 	entries := make(Entries, 1, len(lines))

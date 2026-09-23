@@ -21,7 +21,9 @@ import (
 // 再用同一个 id 取一次（等价于换进程）跑第二轮 Run，证明"客户说了什么"跨 Run 可回放。
 //
 // -offline 时不调模型：直接往会话里追加消息再重建，用来离线检查存储格式与
-// 重建结果。默认（不带 -offline）需要 config.json 里的模型平台配置。
+// 重建结果。-compact 也不调模型：造一段越线的历史压一次，把估算值、触发线、摘要
+// 请求与压缩前后的 entry / 消息条数摆出来。默认（两个都不带）需要 config.json 里的
+// 模型平台配置，此时 -window 给压缩判定提供分母（contextWindow 只能由调用方给）。
 //
 // 会话文件默认落在 <当前目录>/testdata/sessions 下（-sessions 可改），跑完不删：
 // 文件名就是会话 id（chat-001.jsonl），同一个 id 重复运行就续写同一个文件；-key
@@ -68,6 +70,10 @@ func main() {
 	timeout := flag.Duration("timeout", 5*time.Minute, "整轮运行的超时时间")
 	sessionKey := flag.String("key", "chat-001", "会话 id，直接当文件名；留空则新生成一个（chat-…）")
 	interactive := flag.Bool("interactive", false, "一轮一轮地聊：每行一轮，每轮都先按键取会话")
+	compact := flag.Bool("compact", false, "离线演示一次压缩：打印压缩前后的 entry 条数与重建消息条数")
+	window := flag.Int("window", 40000, "模型的上下文窗口（token），0 表示不设窗口、不压缩")
+	turns := flag.Int("turns", 40, "压缩演示造多少轮历史")
+	chars := flag.Int("chars", 2500, "压缩演示每轮消息多少个字符")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -108,6 +114,11 @@ func main() {
 		return
 	}
 
+	if *compact {
+		compactDemo(manager, *window, *turns, *chars)
+		return
+	}
+
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		fail(err)
@@ -115,6 +126,11 @@ func main() {
 	opts := currentPlatform(cfg)
 	if opts == nil || opts.APIKey == "" {
 		fail(fmt.Errorf("当前平台未配置 apiKey（离线验证请加 -offline）"))
+	}
+	// 压缩判定要有分母，而 config.json 里没有这个字段（providers.Options.ContextWindow
+	// 只能由调用方给，见 options.go）。这里就用 -window 顶上。
+	if *window > 0 {
+		opts.ContextWindow = *window
 	}
 
 	if *interactive {
@@ -183,6 +199,72 @@ func offlineReplay(sessions, root, sessionKey string, manager *session.Manager, 
 	}
 	fmt.Printf("\n=== 重新打开后重建的上下文 ===\n")
 	printMessages(reopened.BuildMessages())
+}
+
+// compactDemo 不调模型演示一次压缩：先造一段历史，再把估算值、触发线、摘要请求、
+// 压缩边界与压缩前后的条数全打到屏幕上——"压完到底少没少"是几行数字。
+//
+// 不调模型，所以摘要正文只能是占位文本；真摘要要走模型，见不带 -compact 的真实运行
+// （那条路径的窗口同样由 -window 给）。判定、切点、落盘、折叠用的都是真代码。
+func compactDemo(manager *session.Manager, windowTokens, turns, chars int) {
+	window := session.NewWindow(int64(windowTokens))
+	if !window.Enabled() {
+		fail(fmt.Errorf("窗口 %d 太小，分不出保留区与预留（压缩请给更大的 -window）", windowTokens))
+	}
+
+	appendSyntheticHistory(manager, turns, chars)
+
+	fmt.Printf("\n=== 压缩前 ===\n")
+	printEntries(manager)
+	messages := manager.BuildMessages()
+	entriesBefore := len(manager.Entries())
+	printMessages(messages)
+	tokensBefore := manager.ContextTokens(manager.LeafID(), nil)
+	fmt.Printf("\n重建 %d 条消息，估算 %d token（触发线 %d = 窗口 %d - 预留 %d）\n",
+		len(messages), tokensBefore, window.Tokens-window.Reserve, window.Tokens, window.Reserve)
+	if !window.OverLine(tokensBefore) {
+		fmt.Printf("\n还没越线，不压。想看到压缩就调大 -turns 或 -chars（当前 %d 轮 × %d 字符）。\n",
+			turns, chars)
+		return
+	}
+
+	plan, ok := manager.PlanCompaction(window, manager.LeafID())
+	if !ok {
+		fmt.Println("\n越线了，但这条路径上没有可压的区段（区间里没有合法切点），不压。")
+		return
+	}
+	fmt.Printf("\n=== 摘要请求（真运行时发给模型的就是这两条）===\n")
+	request, err := plan.Request(window)
+	if err != nil {
+		fail(fmt.Errorf("构造摘要请求失败: %w", err))
+	}
+	printMessages(request)
+
+	// 真摘要要模型，离线演示用一段占位文本顶上：落盘的形状与真实压缩一模一样。
+	const demoSummary = "（离线演示用的占位摘要：真运行时这里是一段模型生成的上下文检查点摘要。）"
+	if err = manager.Compact(plan, demoSummary); err != nil {
+		fail(fmt.Errorf("压缩失败: %w", err))
+	}
+
+	fmt.Printf("\n=== 压缩后 ===\n")
+	printEntries(manager)
+	messages = manager.BuildMessages()
+	printMessages(messages)
+	tokensAfter := manager.ContextTokens(manager.LeafID(), nil)
+	fmt.Printf("\n重建 %d 条消息，估算 %d token（压缩前 %d，少 %d）；entry %d 条（压缩前 %d 条，多出来的是压缩边界）\n",
+		len(messages), tokensAfter, tokensBefore, tokensBefore-tokensAfter,
+		len(manager.Entries()), entriesBefore)
+}
+
+// appendSyntheticHistory 造 n 轮"用户 + 助手"历史，每轮 chars 个字符的填充正文。
+// 演示要的只是"一段足以越线的历史"，内容不重要——估算只数字符。
+func appendSyntheticHistory(manager *session.Manager, turns, chars int) {
+	filler := strings.Repeat("u", chars)
+	for turn := 1; turn <= turns; turn++ {
+		appendPair(manager,
+			fmt.Sprintf("第 %d 轮：%s", turn, filler),
+			fmt.Sprintf("第 %d 轮的答复：%s", turn, filler))
+	}
 }
 
 // interactiveChat 从标准输入一轮一轮地聊：每行是一轮输入，:q 或 Ctrl-D 结束。
@@ -288,7 +370,9 @@ func printEntries(manager *session.Manager) {
 }
 
 // renderEntry 把一条 entry 渲染成一行（不含行首的序号列）。header 行只有元信息，
-// 它的 Message 是 nil 接口，这条路径不碰载荷；message 行委派给消息侧的投影。
+// 它的 Message 是 nil 接口，这条路径不碰载荷；message 行委派给消息侧的投影；
+// 压缩边界行把压缩前后的两个数（保留区起点、压缩前的 token 数）连同摘要首行一起
+// 打出来——那正是"压完到底少没少"要看的两个数。
 func renderEntry(entry session.Entry) string {
 	switch entry.Type {
 	case session.EntryHeader:
@@ -296,6 +380,14 @@ func renderEntry(entry session.Entry) string {
 	case session.EntryMessage:
 		return fmt.Sprintf("[%s] ← %s message %s: %s\n",
 			entry.ID, entry.ParentID, messageRole(entry.Message), messageText(entry.Message))
+	case session.EntryCompaction:
+		// 载荷缺失（手写或写坏的行）时不解引用，与 header 行同一条纪律。
+		if entry.Compaction == nil {
+			return fmt.Sprintf("[%s] ← %s compaction %s\n", entry.ID, entry.ParentID, messageMissing)
+		}
+		return fmt.Sprintf("[%s] ← %s compaction first_kept=%s tokens_before=%d summary: %s\n",
+			entry.ID, entry.ParentID, entry.Compaction.FirstKeptEntryID,
+			entry.Compaction.TokensBefore, firstLine(entry.Compaction.Summary))
 	default:
 		return fmt.Sprintf("[%s] ← %s %s\n", entry.ID, entry.ParentID, entry.Type)
 	}

@@ -30,7 +30,7 @@ func (m Messages) ToOpenAIMessages() ([]openaisdk.ChatCompletionMessageParamUnio
 			}
 			result = append(result, user)
 		case *ToolResultMessage:
-			text, err := openAIToolResultText(typed.Content)
+			text, err := typed.Content.openAIToolResultText()
 			if err != nil {
 				return nil, err
 			}
@@ -79,12 +79,12 @@ func (m Messages) ToAnthropicMessages() ([]anthropicsdk.MessageParam, []anthropi
 				case ContentTypeText:
 					blocks = append(blocks, anthropicsdk.NewTextBlock(block.Text))
 				case ContentTypeImage:
-					blocks = append(blocks, anthropicImageBlock(block.Image))
+					blocks = append(blocks, block.Image.anthropicImageBlock())
 				}
 			}
 			result = append(result, anthropicsdk.NewUserMessage(blocks...))
 		case *ToolResultMessage:
-			content, err := anthropicToolResultContent(typed.Content)
+			content, err := typed.Content.anthropicToolResultContent()
 			if err != nil {
 				return nil, nil, err
 			}
@@ -146,7 +146,7 @@ func (m *UserMessage) toOpenAIUserMessage() (openaisdk.ChatCompletionMessagePara
 		case ContentTypeImage:
 			parts = append(parts, openaisdk.ChatCompletionContentPartUnionParam{
 				OfImageURL: &openaisdk.ChatCompletionContentPartImageParam{
-					ImageURL: openaisdk.ChatCompletionContentPartImageImageURLParam{URL: imageInputURL(block.Image)},
+					ImageURL: openaisdk.ChatCompletionContentPartImageImageURLParam{URL: block.Image.imageInputURL()},
 				},
 			})
 		}
@@ -161,7 +161,7 @@ func (m *UserMessage) toOpenAIUserMessage() (openaisdk.ChatCompletionMessagePara
 // Content.Text() 一致）、没有文本但有图片用 "(see attached image)"、两者都没有用
 // "(no tool output)"。后两个字符串是字面量，与脱敏占位 ImagePlaceholderText 无
 // 关——那是摘要与日志路径的词，不进 tool 消息。
-func openAIToolResultText(blocks ContentBlocks) (string, error) {
+func (blocks ContentBlocks) openAIToolResultText() (string, error) {
 	var text strings.Builder
 	hasImage := false
 	for _, block := range blocks {
@@ -170,7 +170,7 @@ func openAIToolResultText(blocks ContentBlocks) (string, error) {
 			text.WriteString(block.Text)
 		case ContentTypeImage:
 			// 图片本身不进入 tool 消息，但缺 Image 的脏块要和别处一样被拒。
-			if _, err := toolResultImageURL(block); err != nil {
+			if _, err := block.toolResultImageURL(); err != nil {
 				return "", err
 			}
 			hasImage = true
@@ -202,9 +202,7 @@ func openAIToolResultText(blocks ContentBlocks) (string, error) {
 //
 // Anthropic 的 tool_result 本身就接受图片成员（ToolResultBlockParamContentUnion.OfImage），
 // 所以这条路径不降级、不丢图。两种分支都拒绝未知块类型，没有图片时也不会静默吞掉脏块。
-func anthropicToolResultContent(
-	blocks ContentBlocks,
-) ([]anthropicsdk.ToolResultBlockParamContentUnion, error) {
+func (blocks ContentBlocks) anthropicToolResultContent() ([]anthropicsdk.ToolResultBlockParamContentUnion, error) {
 	hasImage := false
 	for _, block := range blocks {
 		if block.Type == ContentTypeImage {
@@ -238,12 +236,12 @@ func anthropicToolResultContent(
 				OfText: &anthropicsdk.TextBlockParam{Text: block.Text},
 			})
 		case ContentTypeImage:
-			imageURL, err := toolResultImageURL(block)
+			imageURL, err := block.toolResultImageURL()
 			if err != nil {
 				return nil, err
 			}
 			content = append(content, anthropicsdk.ToolResultBlockParamContentUnion{
-				OfImage: anthropicToolImageBlock(block.Image, imageURL),
+				OfImage: block.Image.anthropicToolImageBlock(imageURL),
 			})
 		default:
 			return nil, fmt.Errorf("unsupported content type %q", block.Type)
@@ -261,15 +259,15 @@ func anthropicToolResultContent(
 
 // toolResultImageURL 取图片块的 URL；缺 Image 的脏块按内容块校验的措辞报错。
 // 图片投影的两条路径都要挡住它，避免取 URL 时 panic。
-func toolResultImageURL(block ContentBlock) (string, error) {
+func (block ContentBlock) toolResultImageURL() (string, error) {
 	if block.Image == nil {
 		return "", fmt.Errorf("image block requires image content")
 	}
 
-	return imageInputURL(block.Image), nil
+	return block.Image.imageInputURL(), nil
 }
 
-func imageInputURL(image *ImageContent) string {
+func (image *ImageContent) imageInputURL() string {
 	if image == nil {
 		return ""
 	}
@@ -279,7 +277,7 @@ func imageInputURL(image *ImageContent) string {
 	return image.URL
 }
 
-func anthropicImageBlock(image *ImageContent) anthropicsdk.ContentBlockParamUnion {
+func (image *ImageContent) anthropicImageBlock() anthropicsdk.ContentBlockParamUnion {
 	if image != nil && image.Data != "" {
 		return anthropicsdk.NewImageBlock(anthropicsdk.Base64ImageSourceParam{
 			MediaType: anthropicsdk.Base64ImageSourceMediaType(image.MIMEType),
@@ -289,7 +287,7 @@ func anthropicImageBlock(image *ImageContent) anthropicsdk.ContentBlockParamUnio
 	return anthropicsdk.NewImageBlock(anthropicsdk.URLImageSourceParam{URL: image.URL})
 }
 
-func anthropicToolImageBlock(image *ImageContent, imageURL string) *anthropicsdk.ImageBlockParam {
+func (image *ImageContent) anthropicToolImageBlock(imageURL string) *anthropicsdk.ImageBlockParam {
 	if image != nil && image.Data != "" {
 		return &anthropicsdk.ImageBlockParam{Source: anthropicsdk.ImageBlockParamSourceUnion{
 			OfBase64: &anthropicsdk.Base64ImageSourceParam{MediaType: anthropicsdk.Base64ImageSourceMediaType(image.MIMEType), Data: image.Data},

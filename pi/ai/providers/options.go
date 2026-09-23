@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -28,6 +29,9 @@ type Options struct {
 	// 的 insertToolResultImages）。Anthropic 不读这个开关：它的 tool_result 内容块
 	// 本身就接受图片，走的是 schema 的 anthropicToolResultContent。
 	SupportsImageInput bool `json:"supportsImageInput,omitempty"`
+	// ContextWindow 是该模型的上下文窗口，单位 token。上下文估算越过
+	// 缺省为 0，表示没配分母：估算无从比较，这时不压缩。
+	ContextWindow int `json:"contextWindow,omitempty"`
 }
 
 // Validate 校验
@@ -45,6 +49,9 @@ func (opts *Options) Validate() error {
 	}
 	if len(opts.BaseURL) == 0 {
 		return pierrors.ErrAIBaseURLRequired
+	}
+	if opts.ContextWindow < 0 {
+		return pierrors.ErrAIInvalidRequest.Wrap(errors.New("contextWindow 不能为负"))
 	}
 
 	return nil

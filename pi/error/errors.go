@@ -104,6 +104,9 @@ var (
 	// ErrRunLimitExceeded 运行控制
 	ErrRunLimitExceeded = New(50000, "运行预算超限")
 	ErrRunLoopDetected  = New(50001, "检测到循环调用")
+	// ErrCompactionFailed 压缩：这次没压成（摘要调用失败、被截断、或摘要为空）。
+	// 不落盘、不改历史，这一轮照常跑——压缩是优化，不是运行前提。
+	ErrCompactionFailed = New(50002, "上下文压缩失败")
 
 	// ErrClosed 生命周期
 	ErrClosed = New(60000, "Agent 已关闭")
@@ -135,15 +138,18 @@ var (
 
 	// 上面四个答"哪个环节"，下面这些答"为什么"：原因码挂在环境码的 cause 上，
 	// CodeOf 取环境码（调用方按它分流），errors.Is 问具体原因（日志与断言用）。
-	ErrSessionFileEmpty             = New(80004, "会话文件为空")
-	ErrSessionHeaderLineInvalid     = New(80005, "会话首行不是合法 JSON")
-	ErrSessionHeaderTypeInvalid     = New(80006, "会话首行不是 session entry")
-	ErrSessionEntryIDMissing        = New(80007, "entry id 不能为空")
-	ErrSessionHeaderPayloadMissing  = New(80008, "header entry 缺少 header 载荷")
-	ErrSessionMessagePayloadMissing = New(80009, "message entry 缺少 message 载荷")
-	ErrSessionEntryTypeUnsupported  = New(80010, "entry 类型不受支持")
-	ErrSessionHeaderNotAppendable   = New(80012, "header 只能由 Create 写入")
-	ErrSessionWorkDirMismatch       = New(80013, "会话文件不属于该工作区")
+	ErrSessionFileEmpty                    = New(80004, "会话文件为空")
+	ErrSessionHeaderLineInvalid            = New(80005, "会话首行不是合法 JSON")
+	ErrSessionHeaderTypeInvalid            = New(80006, "会话首行不是 session entry")
+	ErrSessionEntryIDMissing               = New(80007, "entry id 不能为空")
+	ErrSessionHeaderPayloadMissing         = New(80008, "header entry 缺少 header 载荷")
+	ErrSessionMessagePayloadMissing        = New(80009, "message entry 缺少 message 载荷")
+	ErrSessionEntryTypeUnsupported         = New(80010, "entry 类型不受支持")
+	ErrSessionHeaderNotAppendable          = New(80012, "header 只能由 Create 写入")
+	ErrSessionWorkDirMismatch              = New(80013, "会话文件不属于该工作区")
+	ErrSessionCompactionPayloadMissing     = New(80014, "compaction entry 缺少载荷")
+	ErrSessionCompactionPointerStale       = New(80015, "compaction 边界指针不在当前路径上")
+	ErrSessionCompactionVersionUnsupported = New(80016, "会话文件版本过旧，不支持压缩边界")
 
 	ErrWorkDirRequired      = New(10004, "workDir 不能为空")
 	ErrWorkDirUnopenable    = New(10005, "工作区目录无法打开")

@@ -81,6 +81,29 @@ func TestRenderEntry(t *testing.T) {
 			want: "[entry-5] ← entry-4 message ?: !消息载荷缺失\n",
 		},
 		{
+			name: "压缩边界行",
+			entry: session.Entry{
+				Type:     session.EntryCompaction,
+				ID:       "entry-6",
+				ParentID: "entry-5",
+				Compaction: &session.Compaction{
+					Summary:          "目标：记住工单号\n第二轮…",
+					FirstKeptEntryID: "entry-3",
+					TokensBefore:     50440,
+				},
+			},
+			want: "[entry-6] ← entry-5 compaction first_kept=entry-3 tokens_before=50440 summary: 目标：记住工单号 …\n",
+		},
+		{
+			name: "压缩边界行载荷缺失",
+			entry: session.Entry{
+				Type:     session.EntryCompaction,
+				ID:       "entry-7",
+				ParentID: "entry-6",
+			},
+			want: "[entry-7] ← entry-6 compaction !消息载荷缺失\n",
+		},
+		{
 			name: "未知 entry 类型",
 			entry: session.Entry{
 				Type:     session.EntryType("branch"),

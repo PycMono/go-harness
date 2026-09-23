@@ -50,17 +50,38 @@ type Usage struct {
 	// CostQuality 表示成本可信度（§9.1）：exact 表示分项足以按配置价格
 	// 重算；estimated 不能混入精确成本报表。缺省空值按 estimated 处理。
 	CostQuality CostQuality `json:"cost_quality,omitempty"`
-	// 是其子集；Output 是总输出，Reasoning 是其子集。
-	// CacheReadTokens 是缓存读取令牌数。
+	// CacheReadTokens 是缓存读取令牌数（输入的子集，已含在 InputTokens 里）。
 	CacheReadTokens int64 `json:"cache_read_tokens,omitempty"`
-	// CacheWriteTokens 是缓存写入令牌数。
+	// CacheWriteTokens 是缓存写入令牌数（同样是输入的子集）。
 	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
-	// ReasoningTokens 是推理令牌数。
+	// ReasoningTokens 是推理令牌数（输出的子集，已含在 OutputTokens 里）。
 	ReasoningTokens int64 `json:"reasoning_tokens,omitempty"`
 	// CacheReadPriceUSDPerMillionTokens 是每百万缓存读取令牌的美元价格。
 	CacheReadPriceUSDPerMillionTokens float64 `json:"cache_read_price_usd_per_million_tokens,omitempty"`
 	// CacheWritePriceUSDPerMillionTokens 是每百万缓存写入令牌的美元价格。
 	CacheWritePriceUSDPerMillionTokens float64 `json:"cache_write_price_usd_per_million_tokens,omitempty"`
+}
+
+// TotalTokens 是一次调用的总令牌数：输入 + 输出。
+//
+// 只加这两项，不加缓存读写与推理——它们各自是输入/输出的子集（见字段说明），
+// 所以"输入 + 输出"已经是全部，四项相加等于把缓存算三遍，调用方按它估上下文
+// 大小会凭空高一截（压缩的触发线就跟着失真）。两个 provider 的映射也照此填：
+// anthropic.go 的 InputTokens 已经把 cache 读写加了进去，openai.go 的
+// PromptTokens 本身就含 cached_tokens。
+//
+// 接收者为 nil（响应没有用量）时返回 0；分项为负（脏数据）时同样返回 0，
+// 不用负数去参与判断。
+func (u *Usage) TotalTokens() int64 {
+	if u == nil {
+		return 0
+	}
+	total := u.InputTokens + u.OutputTokens
+	if total < 0 {
+		return 0
+	}
+
+	return total
 }
 
 // StreamEvent 是与具体模型 SDK 无关的模型响应事件。
