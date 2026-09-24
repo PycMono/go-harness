@@ -72,12 +72,31 @@ type TextObserver func(delta string)
 // 历史段（Head），返回 nil 表示不改写。
 type BeforeTurn func(ctx context.Context, turn Turn) (schema.Messages, error)
 
+// TurnReport 是一轮的现场：这一轮的助手消息与它带出的工具结果。只有带工具
+// 调用的轮才会产生它——模型不再要求调用工具时运行就该结束了，没有"还要不要
+// 开下一轮"这个问题要问。
+type TurnReport struct {
+	// Index 是轮次序号，从 0 起，与 run 里 for 的计数一致。
+	Index int
+	// Message 是这一轮的助手消息。
+	Message *schema.AssistantMessage
+	// ToolResults 是这一轮的工具结果消息，下标与 Message.ToolCalls 对齐——
+	// 判据按下标把结果配到调用上，所以这个对齐是签名正确性的一部分。
+	ToolResults schema.Messages
+}
+
+// AfterTurn 在每轮的工具结果写回之后调用，是本包里唯一一个"轮次结束"的开口。
+// 返回 nil 表示继续；返回错误则收尾——循环把已产生的消息连同这个错误一起交回，
+// 不掐 provider 流、不取消正在跑的工具，只是不再开下一轮。
+type AfterTurn func(ctx context.Context, report TurnReport) error
+
 type Loop struct {
 	provider   ai.Provider
 	scheduler  *tools.Scheduler
 	onText     TextObserver
 	onMessage  MessageObserver
 	beforeTurn BeforeTurn
+	afterTurn  AfterTurn
 	maxTurns   int
 }
 
@@ -130,6 +149,11 @@ func WithMessageObserver(observer MessageObserver) LoopOption {
 // WithBeforeTurn 给循环接一个前置钩子。不设置时行为不变。
 func WithBeforeTurn(hook BeforeTurn) LoopOption {
 	return func(loop *Loop) { loop.beforeTurn = hook }
+}
+
+// WithAfterTurn 给循环接一个轮次结束钩子。不设置时行为不变。
+func WithAfterTurn(hook AfterTurn) LoopOption {
+	return func(loop *Loop) { loop.afterTurn = hook }
 }
 
 // observe 把一条刚产生的消息交给观察者。传入的是消息序列里的同一份消息，
@@ -221,6 +245,7 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 		if err != nil {
 			return state.messages(), err
 		}
+		toolResults := make(schema.Messages, 0, len(results))
 		for index := range results {
 			// 工具自身的失败同样作为一条 IsError 的工具消息回给模型，
 			// 让模型自己决定重试还是换条路；只有调度层面的失败才中断。
@@ -234,6 +259,21 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 			// 都指向同一份内存。
 			state.produced = append(state.produced, result)
 			l.observe(result)
+			toolResults = append(toolResults, result)
+		}
+
+		// 每轮的工具结果写回之后给上层一次机会判定这是不是循环。判定放在这里
+		// 而不是每轮开头：只有"还要开下一轮"的那些轮才有这个问题，模型不再要
+		// 工具时上面已经返回了。返回错误就是收尾，与上面 maxTurns 同一种形状
+		// ——带消息返回，不中断正在跑的东西。
+		if l.afterTurn != nil {
+			if err = l.afterTurn(ctx, TurnReport{
+				Index:       turn,
+				Message:     assistant,
+				ToolResults: toolResults,
+			}); err != nil {
+				return state.messages(), err
+			}
 		}
 	}
 }

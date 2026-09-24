@@ -37,6 +37,9 @@ type Options struct {
 	TextObserver TextObserver
 	// MaxTurns 是单次运行的模型调用次数上限，<= 0 时取默认值。
 	MaxTurns int
+	// LoopGuardTurns 是循环检测的阈值：连续这么多轮的工具调用与结果完全相同
+	// 就终止运行。0 取默认值（3），负数关闭——关闭之后只剩 MaxTurns 兜底。
+	LoopGuardTurns int
 	// Session 是会话管理器，必填。history 只认这一个来源：本轮运行前的历史
 	// 从会话重建，本轮产生的消息逐条写回会话。只跑单轮用 session.InMemory()。
 	Session *session.Manager
@@ -65,6 +68,10 @@ type Agent struct {
 	// headLeafID 是本轮开始时的叶子：压缩只切到它之前，本轮的输入与产生的消息
 	// 都留着。每轮 Run 开头重取。
 	headLeafID string
+	// guard 是本轮的循环检测。判据在装配时建一次、挂在循环的轮末钩子上，
+	// 计数每轮 Run 开头清空——它记的是"连续几轮"，跨 Run 留着就会把两次
+	// 不相干的运行接成一段。
+	guard *loopGuard
 	// onCompaction 接收压缩结果，可为 nil。
 	onCompaction func(CompactionEvent)
 	// writeErr 是本轮会话写入失败的第一个错误。观察者在循环的控制流里同步调用，
@@ -142,17 +149,24 @@ func newAgent(ctx context.Context, provider ai.Provider, opts *Options) (*Agent,
 		provider:       provider,
 		window:         session.NewWindow(int64(opts.ProviderOptions.ContextWindow)),
 		onCompaction:   opts.CompactionObserver,
+		guard:          &loopGuard{limit: loopGuardLimit(opts.LoopGuardTurns)},
 		runtime:        runtime,
 	}
 	// 会话写入接在循环的逐条消息观察者上：模型消息与工具结果产生的当口就落盘，
 	// 而不是等 Run 结束后批量补写。压缩挂在每轮的前置钩子上：它要调模型，而
-	// agent 是唯一持有 provider 的地方。
+	// agent 是唯一持有 provider 的地方。循环检测挂在轮末的后置钩子上：它要看
+	// 的现场（这一轮的调用与结果）只有轮末才齐。
+	//
+	// 装配不做条件判断：关不关由 guard.limit 的值决定，observe 自己吞掉。
 	agent.loop = NewLoop(
 		provider,
 		WithScheduler(tools.NewScheduler(registry, maxParallel, opts.Observer, middleware.Defaults()...)),
 		WithTextObserver(opts.TextObserver),
 		WithMaxTurns(opts.MaxTurns),
 		WithBeforeTurn(agent.compactBeforeTurn),
+		WithAfterTurn(func(_ context.Context, report TurnReport) error {
+			return agent.guard.observe(report)
+		}),
 		WithMessageObserver(func(message schema.Message) {
 			// 已经出过错就不再往下写：一次写入失败会滚成一串，真正有用的只有第一个。
 			if agent.writeErr != nil {
@@ -189,9 +203,12 @@ func (a *Agent) Run(ctx context.Context, input *RunInput) (*RunOutput, error) {
 		return nil, err
 	}
 
-	// 一个 Run 一轮账：上一轮的写入错误与本轮起点都不带进这一轮。
+	// 一个 Run 一轮账：上一轮的写入错误、本轮起点与循环检测的计数都不带进
+	// 这一轮。检测计数必须在这里清——它记的是"连续几轮"，跨 Run 留着就会把
+	// 两次不相干的运行接成一段。
 	a.writeErr = nil
 	a.headLeafID = ""
+	a.guard.reset()
 	runContext, err := a.prepareRunContext(ctx, input)
 	if err != nil {
 		return nil, err
