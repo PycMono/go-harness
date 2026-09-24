@@ -24,7 +24,7 @@ type Manager struct {
 	entries Entries
 	leafID  string // 最后一条ID
 	// headerVersion 是首行写的格式版本，装配时读一次。判断"这份会话能不能收压缩
-	
+
 	// 边界"要看它，而那个判断每轮都会走，不该每轮读盘（见 canWriteBoundary）。
 	headerVersion int
 }

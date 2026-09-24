@@ -161,7 +161,7 @@ func main() {
 
 // runTurn 用同一个会话跑一轮：history 只从会话重建，调用方只给本轮输入。
 func runTurn(ctx context.Context, opts *providers.Options, root string, manager *session.Manager, prompt string) {
-	agent, err := pi.NewAgent(&pi.Options{
+	agent, err := pi.NewAgent(ctx, &pi.Options{
 		WorkDir:         root,
 		ProviderOptions: opts,
 		Session:         manager,

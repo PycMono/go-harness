@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/PycMono/go-harness/pi/ai"
 	"github.com/PycMono/go-harness/pi/ai/providers"
 	pierrors "github.com/PycMono/go-harness/pi/error"
+	"github.com/PycMono/go-harness/pi/extension"
 	"github.com/PycMono/go-harness/pi/middleware"
 	"github.com/PycMono/go-harness/pi/schema"
 	"github.com/PycMono/go-harness/pi/session"
@@ -40,6 +42,8 @@ type Options struct {
 	Session *session.Manager
 	// CompactionObserver 接收上下文压缩的结果，可为 nil 表示丢弃。
 	CompactionObserver func(CompactionEvent)
+	// Extensions 是启动期接入的扩展。
+	Extensions []extension.Extension
 }
 
 // CompactionEvent 报告一次压缩的结果：TokensBefore 是压缩前的上下文估算；
@@ -68,10 +72,18 @@ type Agent struct {
 	// 循环在构造期建一次、观察者挂死在上面，所以这个缓冲只能落在 Agent 上，
 	// 每轮 Run 开头清空。
 	writeErr error
+	// runtime 持有启动期接入的扩展，Close 时逆序关。存 *extension.Runtime 而不是
+	// []extension.Closer：关闭顺序与"只关一次"都在 Runtime 里，Agent 只转发。
+	runtime *extension.Runtime
+	// closed 是关闭标记，Run 入口查一次。谁先谁后不影响结果，"只关一次"由
+	// Runtime 的 closeOnce 保证，所以用 Store 就够，不需要 CAS。
+	closed atomic.Bool
 }
 
-// NewAgent 初始化 agent
-func NewAgent(opts *Options) (*Agent, error) {
+// NewAgent 初始化 agent。ctx 是启动期 ctx：扩展拿它做连接（SDK 的 Connect
+// 必须收到 ctx），调用方也能用它给整个启动期设上限——一个连不上的 server
+// 不该把启动拖成 N × Timeout。
+func NewAgent(ctx context.Context, opts *Options) (*Agent, error) {
 	if opts == nil {
 		return nil, pierrors.ErrInitialization.Wrap(errors.New("agent options must not be nil"))
 	}
@@ -87,12 +99,12 @@ func NewAgent(opts *Options) (*Agent, error) {
 		return nil, err
 	}
 
-	return newAgent(provider, opts)
+	return newAgent(ctx, provider, opts)
 }
 
-// newAgent 用给定 provider 完成装配：工具注册、工具执行链、循环与观察者。
-// NewAgent 与测试共用这条装配路径。
-func newAgent(provider ai.Provider, opts *Options) (*Agent, error) {
+// newAgent 用给定 provider 完成装配：工具注册、扩展接入、工具执行链、循环与
+// 观察者。NewAgent 与测试共用这条装配路径。
+func newAgent(ctx context.Context, provider ai.Provider, opts *Options) (*Agent, error) {
 	if opts.Session == nil {
 		return nil, pierrors.ErrInitialization.Wrap(errors.New("session must not be nil"))
 	}
@@ -100,12 +112,21 @@ func newAgent(provider ai.Provider, opts *Options) (*Agent, error) {
 	// 获取 tools 下面的 4 个默认的工具
 	newTools := impl.NewDefaultTools(opts.WorkDir)
 	if len(newTools) > 0 {
-		opts.Tools = append(opts.Tools, newTools...)
+		opts.Tools = append(opts.Tools, newTools...) //支持外部 tools 传入，自定义一些工具
 	}
 
 	// 注册工具
 	registry, err := tools.Register(opts.Tools)
 	if err != nil {
+		return nil, err
+	}
+
+	// 注入扩展
+	runtime, err := extension.NewRuntime(opts.Extensions)
+	if err != nil {
+		return nil, err
+	}
+	if err := runtime.Register(ctx, registry); err != nil {
 		return nil, err
 	}
 	registry.Freeze()
@@ -121,6 +142,7 @@ func newAgent(provider ai.Provider, opts *Options) (*Agent, error) {
 		provider:       provider,
 		window:         session.NewWindow(int64(opts.ProviderOptions.ContextWindow)),
 		onCompaction:   opts.CompactionObserver,
+		runtime:        runtime,
 	}
 	// 会话写入接在循环的逐条消息观察者上：模型消息与工具结果产生的当口就落盘，
 	// 而不是等 Run 结束后批量补写。压缩挂在每轮的前置钩子上：它要调模型，而
@@ -143,7 +165,23 @@ func newAgent(provider ai.Provider, opts *Options) (*Agent, error) {
 	return agent, nil
 }
 
+// Close 关闭全部扩展并标记 Agent 已关闭。幂等：真正关一次，重复调用返回第一次
+// 的结果；多个扩展的关闭错误用 errors.Join 聚合。语义上不等正在跑的 Run、也不
+// 取消它——Run 归调用方的 ctx 管，Close 只做标记与关扩展。已经发出去的那次 MCP
+// 调用会照常跑完（SDK 的会话关闭要等在途请求返回），其后同一轮里新起的调用会
+// 失败（事件 IsError），Run 本身照常返回。
+func (a *Agent) Close(ctx context.Context) error {
+	// 先标记、再关扩展：反过来的话，新 Run 会溜进一个正在关闭的会话，拿到的是
+	// 莫名其妙的调用失败，而不是 ErrClosed。
+	a.closed.Store(true)
+
+	return a.runtime.CloseAll(ctx)
+}
+
 func (a *Agent) Run(ctx context.Context, input *RunInput) (*RunOutput, error) {
+	if a.closed.Load() {
+		return nil, pierrors.ErrClosed
+	}
 	if input == nil {
 		return nil, pierrors.ErrRequestInvalid.Wrap(errors.New("run input must not be nil"))
 	}

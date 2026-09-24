@@ -22,5 +22,29 @@
       "apiKey": "你的 Key",
       "model": "glm-4.5-air"
     }
-  ]
+  ],
+  "mcp": {
+    "servers": [
+      {
+        "name": "exa",
+        "enabled": true,
+        "required": true,
+        "transport": "http",
+        "url": "https://mcp.exa.ai/mcp",
+        "timeout": 60,
+        "header_env": { "X-Api-Key": "EXA_API_KEY" },
+        "allow_tools": ["web_search_exa", "web_fetch_exa"],
+        "tool_prefix": ""
+      },
+      {
+        "name": "fs",
+        "enabled": false,
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+        "cwd": ".",
+        "timeout": 60
+      }
+    ]
+  }
 }

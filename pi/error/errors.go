@@ -151,6 +151,14 @@ var (
 	ErrSessionCompactionPointerStale       = New(80015, "compaction 边界指针不在当前路径上")
 	ErrSessionCompactionVersionUnsupported = New(80016, "会话文件版本过旧，不支持压缩边界")
 
+	// MCP 接入（81000–81099）：远端 server 的配置、连接与工具调用。五个码对应
+	// 五种处置动作——改配置 / 等实现 / 查远端可达性与凭据 / 改白名单 / 查工具。
+	ErrMCPConfigInvalid        = New(81000, "MCP 配置无效")
+	ErrMCPTransportUnsupported = New(81001, "MCP 传输类型尚未实现")
+	ErrMCPConnectFailed        = New(81002, "MCP server 连接或工具发现失败")
+	ErrMCPToolNotFound         = New(81003, "MCP 白名单里的工具远端不存在")
+	ErrMCPToolCallFailed       = New(81004, "MCP 工具调用失败")
+
 	ErrWorkDirRequired      = New(10004, "workDir 不能为空")
 	ErrWorkDirUnopenable    = New(10005, "工作区目录无法打开")
 	ErrAgentsFileMissing    = New(10006, "AGENTS.md 不存在")

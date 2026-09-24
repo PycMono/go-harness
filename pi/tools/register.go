@@ -38,14 +38,14 @@ type Registry struct {
 	frozen bool
 }
 
-// Register 注册所有工具
-func Register(tools []Tool) (*Registry, error) {
-	registry := &Registry{tools: make(map[string]entry, len(tools))}
-	for _, tool := range tools {
-		if err := registry.register(staticToolOwner, tool); err != nil {
-			return nil, err
-		}
+// Register 建一个新注册表，把内置工具整批登记进去，owner 是 staticToolOwner。
+// 它与扩展那条路走同一个入口：整批要么全进要么全退，不必另写一遍逐个注册。
+func Register(items []Tool) (*Registry, error) {
+	registry := &Registry{tools: make(map[string]entry, len(items))}
+	if err := registry.RegisterFor(staticToolOwner, items); err != nil {
+		return nil, err
 	}
+
 	return registry, nil
 }
 
@@ -90,39 +90,100 @@ func (r *Registry) Definitions() []schema.ToolDefinition {
 	return definitions
 }
 
-func (r *Registry) register(owner string, tool Tool) error {
+// RegisterFor 以 owner 名义整批注册；中途失败则把该 owner 本批已注册的
+// 全部摘掉，注册表回到调用前的状态（不影响其他 owner 的工具）。
+// 同一个 owner 只准注册一次：重复注册返回 ErrToolAlreadyRegistered。这条
+// 前提是"回到调用前"能成立的原因——Rollback 按 owner 整批摘除，owner 复用
+// 会把先前那批一起摘掉。冻结不在这里判：写入只有 registerLocked 一处，守卫
+// 跟着写入点走，就没有绕过去的旁路。
+func (r *Registry) RegisterFor(owner string, items []Tool) error {
+	// 空 owner 会让 Rollback 变成"摘掉所有空 owner 的工具"，而这批东西再也分不出
+	// 是谁的：宁可在入口拒掉。
+	if strings.TrimSpace(owner) == "" {
+		return pierrors.ErrToolDefinitionInvalid.Wrap(
+			errors.New("tool owner must not be empty"))
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// 扫一遍而不是另存一份 owner 名册：注册只发生在装配期，这一次 O(n) 不
+	// 值当引入一个新的字段与它的一致性负担。
+	for _, registered := range r.tools {
+		if registered.owner == owner {
+			return pierrors.ErrToolAlreadyRegistered.Wrap(
+				fmt.Errorf("owner %q has already registered tools", owner))
+		}
+	}
+
+	added := make([]string, 0, len(items))
+	for _, tool := range items {
+		name, err := r.registerLocked(owner, tool)
+		if err != nil {
+			for _, name := range added {
+				delete(r.tools, name)
+			}
+			return err
+		}
+		added = append(added, name)
+	}
+
+	return nil
+}
+
+// Rollback 摘除该 owner 名下的全部工具，返回摘除数量。Freeze 只挡新增注册，
+// 不挡摘除：冻结之后仍然允许回滚。
+func (r *Registry) Rollback(owner string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	matched := make([]string, 0, len(r.tools))
+	for name, registered := range r.tools {
+		if registered.owner == owner {
+			matched = append(matched, name)
+		}
+	}
+	for _, name := range matched {
+		delete(r.tools, name)
+	}
+
+	return len(matched)
+}
+
+// registerLocked 是注册的实现，假定调用方已持有写锁；返回登记的工具名，
+// RegisterFor 靠它做整批回滚。校验与 schema 编译都在锁内：注册只发生在装配
+// 期，一次编译的代价换来"锁内状态自洽"这一条。冻结也在这里判——写入只有这一
+// 处，守在这里就不必指望每个调用方都记得。
+func (r *Registry) registerLocked(owner string, tool Tool) (string, error) {
 	if isNilTool(tool) {
-		return pierrors.ErrToolDefinitionInvalid.Wrap(errors.New("tool must not be nil"))
+		return "", pierrors.ErrToolDefinitionInvalid.Wrap(errors.New("tool must not be nil"))
 	}
 
 	definition := tool.Definition()
 	name := strings.TrimSpace(definition.Name)
 	if name == "" {
-		return pierrors.ErrToolDefinitionInvalid.Wrap(errors.New("tool definition name must not be empty"))
+		return "", pierrors.ErrToolDefinitionInvalid.Wrap(errors.New("tool definition name must not be empty"))
 	}
 	if definition.Name != name {
-		return pierrors.ErrToolDefinitionInvalid.Wrap(
+		return "", pierrors.ErrToolDefinitionInvalid.Wrap(
 			fmt.Errorf("tool definition name %q must not contain surrounding whitespace", definition.Name),
 		)
 	}
 	validateArgs, err := compileSchemaValidator(definition)
 	if err != nil {
-		return err
+		return "", err
 	}
 	toolEntry := entry{definition: definition, tool: tool, validateArgs: validateArgs, owner: owner}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if r.frozen {
-		return pierrors.ErrToolRegistryFrozen
+		return "", pierrors.ErrToolRegistryFrozen
 	}
 	if _, exists := r.tools[name]; exists {
-		return pierrors.ErrToolAlreadyRegistered.Wrap(fmt.Errorf("tool %q is already registered", name))
+		return "", pierrors.ErrToolAlreadyRegistered.Wrap(fmt.Errorf("tool %q is already registered", name))
 	}
 	r.tools[name] = toolEntry
 
-	return nil
+	return name, nil
 }
 
 func (r *Registry) lookup(name string) (entry, bool) {

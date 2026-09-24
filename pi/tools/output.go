@@ -40,7 +40,7 @@ func LimitText(output schema.ToolOutput, maxBytes int) schema.ToolOutput {
 		}
 
 		block.Text = text[:cut]
-		limited = append(limited, block, schema.TextBlock(toolOutputTruncationMarker))
+		limited = append(limited, block, schema.TextBlock(OutputTruncationMarker))
 		truncated = true
 		break
 	}

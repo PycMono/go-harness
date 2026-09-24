@@ -110,7 +110,7 @@ func main() {
 		fail(fmt.Errorf("当前平台未配置 apiKey"))
 	}
 
-	agent, err := pi.NewAgent(&pi.Options{
+	agent, err := pi.NewAgent(ctx, &pi.Options{
 		WorkDir:         root,
 		ProviderOptions: opts,
 		MaxParallel:     *maxParallel,

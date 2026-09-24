@@ -10,17 +10,33 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PycMono/go-harness/cmd/internal/mcpconfig"
 	"github.com/PycMono/go-harness/pi"
 	"github.com/PycMono/go-harness/pi/ai/providers"
+	"github.com/PycMono/go-harness/pi/mcp"
 	"github.com/PycMono/go-harness/pi/schema"
 	"github.com/PycMono/go-harness/pi/session"
 	"github.com/PycMono/go-harness/pi/tools"
 )
 
+// closeTimeout 是停机清理（关闭扩展会话）的预算。
+const closeTimeout = 5 * time.Second
+
 // harnessConfig 对应仓库根目录的 config.json，平台条目直接映射为 Options。
 type harnessConfig struct {
 	CurrentPlatform string               `json:"currentPlatform"`
 	Platforms       []*providers.Options `json:"platforms"`
+	// MCP 是 MCP server 配置，servers 里一项一个 server。文件形状由
+	// cmd/internal/mcpconfig 定（字段名对齐生态里的客户端配置），装配时用
+	// mcpServers 转成 pi/mcp 认的运行期结构。
+	MCP struct {
+		Servers []mcpconfig.Entry `json:"servers"`
+	} `json:"mcp"`
+}
+
+// mcpServers 把配置里读进来的 server 转成 pi/mcp 认的那一份。
+func (cfg *harnessConfig) mcpServers() []mcp.ServerConfig {
+	return mcpconfig.ServerConfigs(cfg.MCP.Servers)
 }
 
 // currentPlatform 返回 config.json 中 currentPlatform 指向的平台。
@@ -55,19 +71,16 @@ func printDelta(delta string) {
 	fmt.Print(delta)
 }
 
-// observe 把工具的生命周期事件打到终端，让人看得见循环里发生了什么。事件会被
-// 并发送出，但 fmt 自带互斥，这里的打印够用。
+// observe 把工具的开始事件打到终端，让人看得见循环里调了哪个工具、参数是什么。
+// 只有开始与增量事件经 emit 送出（pi/tools/event.go 的 EventObserver 契约），结束
+// 事件由调度器从返回值交给循环，不会到这里——工具的结果与成败看中间件那几行
+// `"phase":"end","status":…,"byte_count":…` 的日志。事件会被并发送出，但 fmt 自带
+// 互斥，这里的打印够用。
 func observe(event tools.Event) {
-	switch event.Phase {
-	case tools.EventStart:
-		fmt.Printf("\n  → %s %s\n", event.Call.Name, compactArgs(event.Call.Arguments))
-	case tools.EventEnd:
-		status := "ok"
-		if event.IsError {
-			status = fmt.Sprintf("failed(code=%d)", event.ErrorCode)
-		}
-		fmt.Printf("  ← %s %s\n", event.Call.Name, status)
+	if event.Phase != tools.EventStart {
+		return
 	}
+	fmt.Printf("\n  → %s %s\n", event.Call.Name, compactArgs(event.Call.Arguments))
 }
 
 // compactArgs 把工具参数压成一行，太长就截断，避免刷屏。
@@ -92,6 +105,8 @@ func main() {
 	maxParallel := flag.Int("max-parallel", 4, "同一批工具调用的并发上限")
 	maxTurns := flag.Int("max-turns", 0, "单次运行的模型调用次数上限，0 表示用默认值")
 	timeout := flag.Duration("timeout", 5*time.Minute, "整轮运行的超时时间")
+	startupTimeout := flag.Duration("startup-timeout", 60*time.Second,
+		"启动期（含 MCP 连接与工具发现）的总超时时间")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -110,7 +125,18 @@ func main() {
 		fail(fmt.Errorf("解析工作目录失败: %w", err))
 	}
 
-	agent, err := pi.NewAgent(&pi.Options{
+	// 启动期另给一个上限：它是这几个 server 加起来的总预算，单个 server 自己的
+	// timeout 在它之下，两者取先到的那个。
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), *startupTimeout)
+	defer cancelStartup()
+
+	// 名字走 pi/mcp 的缺省（go-harness）：这是真身，不必另起一个。
+	extensions, err := mcp.NewExtension(cfg.mcpServers(), "")
+	if err != nil {
+		fail(err)
+	}
+
+	agent, err := pi.NewAgent(startupCtx, &pi.Options{
 		WorkDir:         root,
 		ProviderOptions: opts,
 		MaxParallel:     *maxParallel,
@@ -118,10 +144,25 @@ func main() {
 		TextObserver:    printDelta,
 		MaxTurns:        *maxTurns,
 		Session:         session.InMemory(),
+		Extensions:      extensions,
 	})
 	if err != nil {
 		fail(err)
 	}
+	// 装配结束就把启动期预算放掉，别把它留给运行期。
+	cancelStartup()
+
+	// 停机期另起一个 ctx：运行期那个此时可能已经超时或被取消，拿它关会话，
+	// 关闭请求本身会立刻失败。（出错退出走的是 os.Exit，不跑 defer，所以这条
+	// 只在正常收尾时生效——进程一退，连接与后台 goroutine 也随它结束。）
+	defer func() {
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), closeTimeout)
+		defer cancelClose()
+		if err := agent.Close(closeCtx); err != nil {
+			// 不改退出码：已经跑完那一轮的结果比关闭失败重要。
+			fmt.Fprintf(os.Stderr, "关闭扩展失败: %v\n", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
