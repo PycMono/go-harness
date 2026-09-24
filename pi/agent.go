@@ -230,9 +230,12 @@ func (a *Agent) Run(ctx context.Context, input *RunInput) (*RunOutput, error) {
 
 	messages, err := a.loop.run(ctx, runContext)
 	// 运行失败时同样返回已经产生的消息序列，调用方可以据此看到模型跑到哪
-	// 一步才出的问题。
+	// 一步才出的问题。两个错可能同时发生：运行错在前、写入错在后，两个都带上
+	// ——只报运行错会吞掉"盘上历史缺了一段"，只报写入错会吞掉"模型为什么停"。
+	// CodeOf 走 errors.As，先左后右，所以拿到的仍是运行错的码；errors.Is 能同时
+	// 找到写入失败的原因。
 	if err != nil {
-		return &RunOutput{message: messages}, err
+		return &RunOutput{message: messages}, errors.Join(err, a.writeErr)
 	}
 	// 会话没写下去比模型出错更隐蔽：消息可能已经发给模型了，但盘上没有，
 	// 下一轮重建出来的历史就缺一段，必须让调用方知道。

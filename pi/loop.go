@@ -2,7 +2,10 @@ package pi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
+	"sync"
 
 	"github.com/PycMono/go-harness/pi/ai"
 	pierrors "github.com/PycMono/go-harness/pi/error"
@@ -98,6 +101,11 @@ type Loop struct {
 	beforeTurn BeforeTurn
 	afterTurn  AfterTurn
 	maxTurns   int
+	// steering 是外部在运行期间写入、还没交付的消息副本。它在每轮调用模型
+	// 之前被取走，作为一条普通消息注入本轮请求。写入方与 run 不在同一个
+	// goroutine（Run 是同步阻塞的），所以要锁。
+	steering   schema.Messages
+	steeringMu sync.Mutex
 }
 
 func NewLoop(provider ai.Provider, options ...LoopOption) *Loop {
@@ -165,6 +173,105 @@ func (l *Loop) observe(message schema.Message) {
 	l.onMessage(message)
 }
 
+// isNilMessage 判断一条消息是不是"接口非 nil、装着一个类型化 nil"的形态。
+// 与 pi/tools 的 isNilTool（pi/tools/interface.go:16-28）、pi/extension 的
+// isNilExtension（pi/extension/runtime.go:116-130）同一个写法：那两处是同类
+// 问题的既有解法，这里是第三处，照抄而不是各写一套。
+func isNilMessage(message schema.Message) bool {
+	if message == nil {
+		return true
+	}
+	value := reflect.ValueOf(message)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+// Steer 在运行期间从外部写入一条消息，返回 nil 表示已入队。它在下一次模型
+// 调用之前被取走，注入位置在这一轮的助手消息与工具结果之后——既是协议要求的
+// 顺序（工具结果必须紧跟发起它的助手消息），也是本仓库自己的排布约定
+// （Turn.Messages 拼出来是历史 → 本轮固定段 → 已产生的消息）。
+//
+// 队列跨 Run 存活：运行开始前写入的消息在第一次模型调用之前交付；运行已经
+// 结束时写入的消息留给下一次 Run。Run 是同步阻塞的，所以调用方要在运行期间
+// 写入，只能从另一个 goroutine 调这个方法。
+//
+// 入队的是副本，不是调用方那一条：具体类型都是指针，存原件的话调用方在返回
+// 之后改内容，就会让校验过的那份与发出去的那份不是同一份，并与正在读它的 run
+// 构成数据竞争。副本用 ContentBlocks.Clone（pi/schema/message_content.go:117，
+// 连 Image 指向的那份一起复制），所以图片也是安全的。
+//
+// 三道拒绝，都在写入口一次做完：
+//
+//  1. typed nil。message == nil 抓不到 (*schema.UserMessage)(nil) 这种值，
+//     它进队之后要到组装请求时才炸，那时离调用点已经很远。
+//  2. 角色必须是 user。系统消息在 Anthropic 上会被收进单独的 system 参数，
+//     "插在工具结果之后"在那边不成立；在这里拒绝，比在组装请求时静默挪位好
+//     ——调用方当场知道这条通道不干那件事。
+//  3. 消息自己合法（Validate）。校验的是副本，也就是真正会发出去的那一份。
+//     内容为空、图片张数这些 Run 入口会查的东西这里不查：那是请求边界的事，
+//     写入方是同一个进程里的代码，不在通道里堆规则。
+//
+// 三道都用 ErrRequestInvalid（10002）：它们都是调用方写了不该写的东西，不是
+// 运行状态的问题。
+func (l *Loop) Steer(message schema.Message) error {
+	if isNilMessage(message) {
+		return pierrors.ErrRequestInvalid.Wrap(errors.New("steering message must not be nil"))
+	}
+	if role := message.Role(); role != schema.RoleUser {
+		return pierrors.ErrRequestInvalid.Wrap(fmt.Errorf(
+			"steering message must be a user message, got %q", role))
+	}
+
+	// 复制放在校验之前：校验的与入队的是同一份（那条副本）。
+	queued := &schema.UserMessage{Content: message.Blocks().Clone()}
+	if err := queued.Validate(); err != nil {
+		return pierrors.ErrRequestInvalid.Wrap(err)
+	}
+
+	l.steeringMu.Lock()
+	defer l.steeringMu.Unlock()
+	l.steering = append(l.steering, queued)
+
+	return nil
+}
+
+// deliver 把取走的消息注入这一轮已经产生的序列，并逐条交给观察者。
+// 必须走 observe：会话落盘挂在消息观察者上，绕过它注入的消息只在内存里——
+// 盘上的历史与当时发出的请求不一致，下一轮重建就缺一段。
+//
+// 顺序是我们自己保证的，不是 session 查出来的：Append 在 ParentID 为空时
+// 自动取当前叶子（pi/session/manager.go:143-148），观察者走的正是这条路
+// （不带 ParentID），所以插在工具结果之前不会报 80002，只会静默把顺序写错。
+// 取走点必须落在"这一轮的助手消息与工具结果都写回之后"，测试直接断言消息
+// 序列。
+//
+// 记账：取走点一交付的那些在窗口判定之前进 Produced，参与这一轮的上下文大小
+// 估算；取走点二交付的那些是在判定之后才进的，要到下一轮才算进大小。压缩本身
+// 留有余量，这不影响判定；写在这里免得将来有人对着 token 数觉得少了一条。
+func (l *Loop) deliver(messages schema.Messages, state *runState) {
+	for _, message := range messages {
+		state.produced = append(state.produced, message)
+		l.observe(message)
+	}
+}
+
+// drainSteering 取走并清空排队中的消息。没有时返回 nil。
+func (l *Loop) drainSteering() schema.Messages {
+	l.steeringMu.Lock()
+	defer l.steeringMu.Unlock()
+	if len(l.steering) == 0 {
+		return nil
+	}
+	pending := l.steering
+	l.steering = nil
+
+	return pending
+}
+
 // definitions 返回本轮可用工具的快照。注册表已按名称排好序，这里只是把值
 // 换成上下文使用的指针形式。
 func (l *Loop) definitions() schema.ToolDefinitions {
@@ -209,6 +316,15 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 				fmt.Errorf("连续 %d 轮模型调用都要求执行工具，已终止运行", l.maxTurns))
 		}
 
+		// 排队中的插话先交付，再让压缩做窗口判定。反过来（先压缩后交付）的话，
+		// 这批消息不在 turn.extra() 里（pi/agent.go 的 compactBeforeTurn 用它
+		// 判要不要压），压缩既不会因为它们而触发、也不会在压完之后把它们的
+		// 体量算进去——写得多就直接把请求顶过窗口，运行被 provider 的 20003
+		// 打掉。
+		//
+		// 运行开始前写入的消息也在这里交付：循环第一次进来就走到这里。
+		l.deliver(l.drainSteering(), state)
+
 		// 每轮调用模型之前给上层一次机会改写历史段（压缩就挂在这里）。返回 nil
 		// 表示不改写；报错则带上已经产生的部分退出。
 		if l.beforeTurn != nil {
@@ -220,6 +336,11 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 				state.head = head
 			}
 		}
+
+		// 压缩期间写进来的消息在这里补捞：压缩要调一次模型，慢的话是几秒，
+		// 那段时间写入的不该等到下一轮。pi.dev 在 agent-loop.ts:203 单独留了
+		// 一个"压缩完再捞一次"的点，理由相同。
+		l.deliver(l.drainSteering(), state)
 
 		message, err := l.complete(ctx, state)
 		if err != nil {

@@ -17,6 +17,13 @@ type Runner interface {
 	Run(context.Context, *RunInput) (*RunOutput, error)
 }
 
+// Steerer 是运行期间往循环里写消息的入口。它与 Runner 分开：能不能跑与能不能
+// 插话是两件事，实现 Runner 的人不必被迫实现它。Run 是同步阻塞的，所以要在
+// 运行期间写入只能从另一个 goroutine 调；Run 返回之后写入的消息留给下一次 Run。
+type Steerer interface {
+	Steer(message schema.Message) error
+}
+
 // RunInput 是一次运行的当前输入。历史由 Options.Session 管理，不由调用方传入。
 type RunInput struct {
 	// Prompt 是本轮用户输入文本。
