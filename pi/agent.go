@@ -149,7 +149,7 @@ func newAgent(ctx context.Context, provider ai.Provider, opts *Options) (*Agent,
 		provider:       provider,
 		window:         session.NewWindow(int64(opts.ProviderOptions.ContextWindow)),
 		onCompaction:   opts.CompactionObserver,
-		guard:          &loopGuard{limit: loopGuardLimit(opts.LoopGuardTurns)},
+		guard:          newLoopGuard(opts.LoopGuardTurns),
 		runtime:        runtime,
 	}
 	// 会话写入接在循环的逐条消息观察者上：模型消息与工具结果产生的当口就落盘，
@@ -167,16 +167,23 @@ func newAgent(ctx context.Context, provider ai.Provider, opts *Options) (*Agent,
 		WithAfterTurn(func(_ context.Context, report TurnReport) error {
 			return agent.guard.observe(report)
 		}),
-		WithMessageObserver(func(message schema.Message) {
-			// 已经出过错就不再往下写：一次写入失败会滚成一串，真正有用的只有第一个。
-			if agent.writeErr != nil {
-				return
-			}
-			agent.writeErr = agent.session.Append(session.Entry{Type: session.EntryMessage, Message: message})
-		}),
+		WithMessageObserver(agent.recordMessage),
 	)
 
 	return agent, nil
+}
+
+// recordMessage 把循环逐条产生的消息写回会话。它接在消息观察者上，与压缩
+// （compactBeforeTurn）、循环检测一样，都是"装配处接一个方法"的形状。
+//
+// 观察者在循环的控制流里同步调用，没有返回错误的通道，所以错误只能先攒在
+// writeErr 里，等 loop.run 返回后由 Run 透出。已经出过错就不再往下写：一次
+// 写入失败会滚成一串，真正有用的只有第一个。
+func (a *Agent) recordMessage(message schema.Message) {
+	if a.writeErr != nil {
+		return
+	}
+	a.writeErr = a.session.Append(session.Entry{Type: session.EntryMessage, Message: message})
 }
 
 // Close 关闭全部扩展并标记 Agent 已关闭。幂等：真正关一次，重复调用返回第一次
@@ -190,6 +197,13 @@ func (a *Agent) Close(ctx context.Context) error {
 	a.closed.Store(true)
 
 	return a.runtime.CloseAll(ctx)
+}
+
+// Steer 往正在运行的循环里写一条消息。没有运行在跑时消息入队，等下一次 Run
+// 开始前交付。校验全在 Loop.Steer 里，这里只转发；也不查 closed——入队不碰任何
+// 资源，"这次运行能不能开"是 Run 入口的事。
+func (a *Agent) Steer(message schema.Message) error {
+	return a.loop.Steer(message)
 }
 
 func (a *Agent) Run(ctx context.Context, input *RunInput) (*RunOutput, error) {

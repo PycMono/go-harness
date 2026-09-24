@@ -28,6 +28,17 @@ type loopGuard struct {
 	repeats int
 }
 
+// newLoopGuard 按装配处的配置造一个判据：0 取默认值，负数表示关闭。关闭不是
+// 不装钩子，而是把 limit 设成非正数，由 observe 自己吞掉——装配处因此不用写
+// 条件分支，Loop.run 里那个 l.afterTurn != nil 也就永远是真。
+func newLoopGuard(configured int) *loopGuard {
+	if configured == 0 {
+		return &loopGuard{limit: defaultLoopGuardTurns}
+	}
+
+	return &loopGuard{limit: configured}
+}
+
 // observe 记下这一轮的签名并判定。返回 nil 表示这一轮不是循环。
 // limit <= 0 表示关闭，直接返回——装配不做条件判断，关不关由值决定。
 func (g *loopGuard) observe(report TurnReport) error {
@@ -52,16 +63,6 @@ func (g *loopGuard) observe(report TurnReport) error {
 // reset 清空计数。一个 Run 一轮账：跨 Run 留着的话，两次毫不相干的运行
 // 各调一次同一个工具就会被算成重复。
 func (g *loopGuard) reset() { g.last, g.repeats = "", 0 }
-
-// loopGuardLimit 把装配处的配置翻成判据的阈值：0 取默认值，负数表示关闭
-// （原样带过去，由 observe 吞掉），正数就是它自己。
-func loopGuardLimit(configured int) int {
-	if configured == 0 {
-		return defaultLoopGuardTurns
-	}
-
-	return configured
-}
 
 // signatureOf 是一轮工具调用与结果的指纹：批内每个调用按原顺序取「工具名 +
 // 规范化参数 + 结果」，再用换行拼起来。不做排序——调度器按调用在批内的原顺序
