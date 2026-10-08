@@ -336,16 +336,38 @@ func (a *Agent) compactBeforeTurn(ctx context.Context, turn Turn) (schema.Messag
 		return nil, nil
 	}
 
-	summary, err := a.summarize(ctx, plan)
-	if err != nil {
+	// 两个提前返回都在压缩 Span 之外：那两条路上什么都没压，不该在 trace 上留
+	// 一个空 Span。
+	//
+	// failure 是"这次压不动"那一条路的错误。它既走闭包的返回值（让 Span 标红）
+	// 又走这个局部变量（给下面吞掉）——压不动不算这一轮失败，但 Span 必须红，
+	// 否则这个 Span 就永远是绿的，而它存在的全部意义正是让人看见"压缩没生效"。
+	var failure error
+	err := contexttracing.WithSpan(ctx, observability.SpanNameCompaction, func(ctx context.Context) error {
+		contexttracing.WithKV(ctx,
+			contexttracing.KV(observability.AttrCompactionBeforeTokens, plan.TokensBefore))
+
+		summary, err := a.summarize(ctx, plan)
+		if err != nil {
+			failure = err
+
+			return err
+		}
+
+		// 落盘失败不吞：盘上的历史从此缺一块，必须透出。
+		return a.session.Compact(plan, summary)
+	},
+		contexttracing.WithErrorClassifier(observability.ClassifyError),
+	)
+
+	if failure != nil {
 		// 压不动不算这一轮失败：历史还是完整的，只是继续贴着窗口跑。
 		// 真溢出了让 provider 去报（20003），比在这里把客户的这一轮打断好。
-		a.report(CompactionEvent{TokensBefore: plan.TokensBefore, Err: err})
+		a.report(CompactionEvent{TokensBefore: plan.TokensBefore, Err: failure})
 
 		return nil, nil
 	}
-
-	if err = a.session.Compact(plan, summary); err != nil {
+	if err != nil {
 		// 落盘失败与会话写入失败同类：盘上的历史从此缺一块，必须透出。
 		return nil, err
 	}
@@ -359,6 +381,10 @@ func (a *Agent) compactBeforeTurn(ctx context.Context, turn Turn) (schema.Messag
 
 // summarize 用当前模型生成一段摘要。这是一次独立、不带工具的调用：不进循环、
 // 不发工具描述、不接文本观察者（摘要不该流到用户屏幕上）。
+//
+// 它不碰观测：这次模型调用的 chat Span 由装配处的 TracingProvider 开（装饰器
+// 白送的），它自己只负责"摘要合不合格"。压缩的账（压前多大、成没成）由调用者
+// compactBeforeTurn 记。
 func (a *Agent) summarize(ctx context.Context, plan *session.Plan) (string, error) {
 	request, err := plan.Request(a.window)
 	if err != nil {

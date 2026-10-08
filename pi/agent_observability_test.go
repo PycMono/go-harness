@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/PycMono/go-harness/pi/ai"
@@ -98,6 +99,23 @@ func spanNames(spans []sdktrace.ReadOnlySpan) []string {
 	}
 
 	return names
+}
+
+// turnSpanAt 取第 index 轮的 turn Span。一次运行里 turn Span 必然有多个，
+// 名字认不出来，只能按 turn_index 认——所以 spanByName 用不到它身上。
+func turnSpanAt(t *testing.T, spans []sdktrace.ReadOnlySpan, index int64) sdktrace.ReadOnlySpan {
+	t.Helper()
+	for _, span := range spans {
+		if span.Name() != observability.SpanNameTurn {
+			continue
+		}
+		if attributeMap(span.Attributes())[observability.AttrTurnIndex].AsInt64() == index {
+			return span
+		}
+	}
+	t.Fatalf("没找到 turn_index = %d 的 turn Span（实际有 %v）", index, spanNames(spans))
+
+	return nil
 }
 
 // TestRunSpanCoversSuccessfulRun 钉住整棵树的形状：一次 Run 一个 pi.run，底下
@@ -243,5 +261,222 @@ func TestRunSpanCoversSessionWriteFailure(t *testing.T) {
 	runSpan := spanByName(t, recorder.Ended(), observability.SpanNameRun)
 	if runSpan.Status().Code != codes.Error {
 		t.Error("会话写入失败时 run Span 应当红着")
+	}
+}
+
+// 下面的压缩用例共用一个历史。触发线是 agentContextWindow 折出来的 16384
+// （见 agentContextWindow 的注释），这份历史正好踩在线上、又留得下一个非空的
+// 摘要段：
+//
+//	u1                    最老的一条，会被摘要掉
+//	assistant(40000 个 "a", Usage.InputTokens=20000)
+//	                      保留段的第一条。真内容是 40000 个 ASCII 字符 ≈ 10000
+//	                      token，正好够 findCutPoint 从新往旧数满 KeepRecent
+//	                      (10000)；Usage 那 20000 是估算的基数，让 ContextTokens
+//	                      报 20001 > 16384。用法当基数是最省的造法——不用真堆
+//	                      两万 token 的正文。
+//	u2                    叶子
+//
+// 计划成立时 TokensBefore = 20001，Summarize = [u1]。
+
+// seededSession 造上面那份历史，返回会话。
+func seededSession(t *testing.T) *session.Manager {
+	t.Helper()
+	sessions := session.InMemory()
+	appendEntry(t, sessions, &schema.UserMessage{
+		Content: schema.ContentBlocks{schema.TextBlock("u1")},
+	})
+	appendEntry(t, sessions, &schema.AssistantMessage{
+		Content:      schema.ContentBlocks{schema.TextBlock(strings.Repeat("a", 40000))},
+		Usage:        &schema.Usage{InputTokens: 20000},
+		FinishReason: schema.FinishReasonStop,
+	})
+	appendEntry(t, sessions, &schema.UserMessage{
+		Content: schema.ContentBlocks{schema.TextBlock("u2")},
+	})
+
+	return sessions
+}
+
+func appendEntry(t *testing.T, sessions *session.Manager, message schema.Message) {
+	t.Helper()
+	if err := sessions.Append(session.Entry{Type: session.EntryMessage, Message: message}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+}
+
+// TestCompactionSpanNotOpenedBelowTriggerLine 是决策 13 的回归测试：Span 开在
+// 函数顶上时这个断言会挂，而且挂的方式是"每轮多一个空 Span"——不会有人注意到。
+func TestCompactionSpanNotOpenedBelowTriggerLine(t *testing.T) {
+	recorder := installRecordingProvider(t)
+	workDir := t.TempDir()
+	writeAgentsFile(t, workDir)
+	// 空会话：越不过触发线。
+	agent := newTestAgent(t, workDir, &fakeProvider{
+		responses: []*schema.AssistantMessage{textResponse("你好")},
+	}, session.InMemory())
+
+	if _, err := agent.Run(context.Background(), &RunInput{Prompt: "在吗"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	for _, span := range recorder.Ended() {
+		if span.Name() == observability.SpanNameCompaction {
+			t.Fatal("没越过触发线却开了压缩 Span")
+		}
+	}
+}
+
+// TestCompactionSpanNotOpenedWithoutPlan 是第二个提前返回：越过了触发线但计划
+// 不成立（保留区没数满，摘要段是空的），同样不该留 Span。
+func TestCompactionSpanNotOpenedWithoutPlan(t *testing.T) {
+	recorder := installRecordingProvider(t)
+
+	sessions := session.InMemory()
+	appendEntry(t, sessions, &schema.UserMessage{
+		Content: schema.ContentBlocks{schema.TextBlock("u1")},
+	})
+	// Usage 大、正文小：ContextTokens 报 20001 越过触发线，但保留区从新往旧
+	// 数不满 KeepRecent，findCutPoint 退到起点，摘要段为空 ⇒ 计划不成立。
+	appendEntry(t, sessions, &schema.AssistantMessage{
+		Content:      schema.ContentBlocks{schema.TextBlock("a1")},
+		Usage:        &schema.Usage{InputTokens: 20000},
+		FinishReason: schema.FinishReasonStop,
+	})
+
+	workDir := t.TempDir()
+	writeAgentsFile(t, workDir)
+	agent := newTestAgent(t, workDir, &fakeProvider{
+		responses: []*schema.AssistantMessage{textResponse("你好")},
+	}, sessions)
+
+	if _, err := agent.Run(context.Background(), &RunInput{Prompt: "在吗"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	for _, span := range recorder.Ended() {
+		if span.Name() == observability.SpanNameCompaction {
+			t.Fatal("计划不成立却开了压缩 Span")
+		}
+	}
+}
+
+// TestCompactionSpanOnSuccess 钉住压缩成功时的形状：恰好一个压缩 Span、带压缩
+// 前的体量、绿的，且它下面只挂一个 chat Span（摘要请求）——本轮的正式请求那个
+// chat Span 是它的兄弟，不是子节点。
+func TestCompactionSpanOnSuccess(t *testing.T) {
+	recorder := installRecordingProvider(t)
+	workDir := t.TempDir()
+	writeAgentsFile(t, workDir)
+	sessions := seededSession(t)
+	agent := newTestAgent(t, workDir, &fakeProvider{
+		responses: []*schema.AssistantMessage{
+			textResponse("## Goal\n把测试写完"), // 第一次 Stream：摘要请求
+			textResponse("你好"),               // 第二次 Stream：正式请求
+		},
+	}, sessions)
+
+	if _, err := agent.Run(context.Background(), &RunInput{Prompt: "在吗"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	spans := recorder.Ended()
+	compactionSpan := spanByName(t, spans, observability.SpanNameCompaction)
+	if compactionSpan.Status().Code == codes.Error {
+		t.Errorf("压缩成功时不该标红：%s", compactionSpan.Status().Description)
+	}
+	if got, want := attributeMap(compactionSpan.Attributes())[observability.AttrCompactionBeforeTokens].AsInt64(), int64(20001); got != want {
+		t.Errorf("%s = %d, want %d", observability.AttrCompactionBeforeTokens, got, want)
+	}
+
+	// 压缩 Span 的子节点恰好一个 chat（摘要请求）。本轮的正式请求是它的兄弟。
+	children := 0
+	for _, span := range spans {
+		if span.Parent().SpanID() == compactionSpan.SpanContext().SpanID() {
+			children++
+		}
+	}
+	if children != 1 {
+		t.Fatalf("压缩 Span 的子节点数 = %d, want 1（本轮的正式请求是它的兄弟，不是子节点）", children)
+	}
+	// 摘要请求与正式请求是两个 chat Span，总共两个——压缩 Span 那一层是用来
+	// 区分它们的，少一层就看不出哪个是压缩。
+	chats := 0
+	for _, span := range spans {
+		if span.Name() == observability.ChatSpanName("model-y") {
+			chats++
+		}
+	}
+	if chats != 2 {
+		t.Fatalf("chat Span 数 = %d, want 2（摘要 + 正式请求）", chats)
+	}
+}
+
+// TestCompactionSpanRedButRunContinues 是决策 15：压缩失败时 Span 标红，而这一
+// 轮照常跑下去、Run 的返回值是 (output, nil)。它同时锁住了"Span 标红"与
+// "错误被吞"这两个看起来矛盾的行为。
+func TestCompactionSpanRedButRunContinues(t *testing.T) {
+	recorder := installRecordingProvider(t)
+	workDir := t.TempDir()
+	writeAgentsFile(t, workDir)
+	agent := newTestAgent(t, workDir, &fakeProvider{
+		responses: []*schema.AssistantMessage{
+			// 摘要请求：正文为空 ⇒ summarize 报 ErrCompactionFailed("摘要为空")。
+			// Usage 给一个空结构体，让响应先过计量的严格校验、走到文本那一步——
+			// 不带 Usage 的话会先被计量以 20000 拦下，那样测的就不是"摘要为空"了。
+			{Usage: &schema.Usage{}},
+			textResponse("你好"),
+		},
+	}, seededSession(t))
+
+	output, err := agent.Run(context.Background(), &RunInput{Prompt: "在吗"})
+	if err != nil {
+		t.Fatalf("压不动不算这一轮失败，Run() error = %v", err)
+	}
+	if output == nil {
+		t.Fatal("Run() 返回了 nil 输出")
+	}
+
+	compactionSpan := spanByName(t, recorder.Ended(), observability.SpanNameCompaction)
+	if compactionSpan.Status().Code != codes.Error {
+		t.Error("压缩失败时 Span 必须红着——它存在的全部意义就是让人看见压缩没生效")
+	}
+	if got, want := compactionSpan.Status().Description, "50002"; got != want {
+		t.Errorf("状态描述 = %q, want %q（ErrCompactionFailed）", got, want)
+	}
+}
+
+// TestRejectedToolCallHasNoSpan 是决策 16：未注册的工具在 Scheduler 的查表处就
+// 被拒了，不经过中间件链，所以没有 execute_tool Span。它们照常作为一条 IsError
+// 的工具消息回给模型。
+func TestRejectedToolCallHasNoSpan(t *testing.T) {
+	recorder := installRecordingProvider(t)
+	workDir := t.TempDir()
+	writeAgentsFile(t, workDir)
+	agent := newTestAgent(t, workDir, &fakeProvider{
+		responses: []*schema.AssistantMessage{
+			toolCallResponse("call-1", "not_registered", `{}`),
+			textResponse("好，换条路"),
+		},
+	}, session.InMemory())
+
+	output, err := agent.Run(context.Background(), &RunInput{Prompt: "在吗"})
+	if err != nil {
+		t.Fatalf("被拒绝的工具调用不该中断运行，Run() error = %v", err)
+	}
+	if output == nil {
+		t.Fatal("Run() 返回了 nil 输出")
+	}
+
+	for _, span := range recorder.Ended() {
+		if strings.HasPrefix(span.Name(), "execute_tool") {
+			t.Fatalf("被拒绝的工具调用不该有 Span，却看到了 %q", span.Name())
+		}
+	}
+	// 它仍然在 trace 上的证据是那一轮的 tools_requested：模型确实要过工具，
+	// 只是没执行成功。
+	turnSpan := turnSpanAt(t, recorder.Ended(), 0)
+	if got := attributeMap(turnSpan.Attributes())[observability.AttrToolsRequested].AsInt64(); got != 1 {
+		t.Errorf("%s = %d, want 1", observability.AttrToolsRequested, got)
 	}
 }
