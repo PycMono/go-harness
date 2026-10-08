@@ -7,8 +7,10 @@ import (
 	"reflect"
 	"sync"
 
+	contexttracing "github.com/PycMono/go-context-sdk/tracing"
 	"github.com/PycMono/go-harness/pi/ai"
 	pierrors "github.com/PycMono/go-harness/pi/error"
+	"github.com/PycMono/go-harness/pi/observability"
 	"github.com/PycMono/go-harness/pi/schema"
 	"github.com/PycMono/go-harness/pi/tools"
 )
@@ -308,6 +310,8 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 	}
 
 	for turn := 0; ; turn++ {
+		// 轮首的两处退出判定落在轮与轮之间、不属于任何一轮：取消与超预算都
+		// 在 turn Span 之外，Span 里只有真正跑起来的那一轮的工作。
 		if err := ctx.Err(); err != nil {
 			return state.messages(), pierrors.ErrCanceled.Wrap(fmt.Errorf("agent 运行已取消: %w", err))
 		}
@@ -316,87 +320,125 @@ func (l *Loop) run(ctx context.Context, runContext *Context) (schema.Messages, e
 				fmt.Errorf("连续 %d 轮模型调用都要求执行工具，已终止运行", l.maxTurns))
 		}
 
-		// 排队中的插话先交付，再让压缩做窗口判定。反过来（先压缩后交付）的话，
-		// 这批消息不在 turn.extra() 里（pi/agent.go 的 compactBeforeTurn 用它
-		// 判要不要压），压缩既不会因为它们而触发、也不会在压完之后把它们的
-		// 体量算进去——写得多就直接把请求顶过窗口，运行被 provider 的 20003
-		// 打掉。
-		//
-		// 运行开始前写入的消息也在这里交付：循环第一次进来就走到这里。
-		l.deliver(l.drainSteering(), state)
-
-		// 每轮调用模型之前给上层一次机会改写历史段（压缩就挂在这里）。返回 nil
-		// 表示不改写；报错则带上已经产生的部分退出。
-		if l.beforeTurn != nil {
-			head, err := l.beforeTurn(ctx, state.turn())
-			if err != nil {
-				return state.messages(), err
-			}
-			if head != nil {
-				state.head = head
-			}
-		}
-
-		// 压缩期间写进来的消息在这里补捞：压缩要调一次模型，慢的话是几秒，
-		// 那段时间写入的不该等到下一轮。pi.dev 在 agent-loop.ts:203 单独留了
-		// 一个"压缩完再捞一次"的点，理由相同。
-		l.deliver(l.drainSteering(), state)
-
-		message, err := l.complete(ctx, state)
+		stop, err := l.step(ctx, state, turn)
 		if err != nil {
 			return state.messages(), err
 		}
-		// Provider 的 Stream.Result 已经把返回类型收窄为助手消息，Loop 不再需要
-		// 对通用 Message 做运行时类型断言。
-		assistant := message
-		// 模型消息先入列：工具结果必须紧跟在发起调用的那条助手消息之后，
-		// 两家协议都按这个顺序还原上下文。
-		state.produced = append(state.produced, message)
-		l.observe(message)
-
-		if len(assistant.ToolCalls) == 0 {
+		if stop {
+			// 模型不再要求调用工具，运行正常结束，消息序列照常返回。
 			return state.messages(), nil
 		}
-		if l.scheduler == nil {
-			return state.messages(), pierrors.ErrInternal.Wrap(fmt.Errorf(
-				"模型请求调用工具 %q，但本轮运行没有接入工具调度器", assistant.ToolCalls[0].Name))
-		}
-
-		results, err := l.scheduler.ExecuteBatch(ctx, assistant.ToolCalls)
-		if err != nil {
-			return state.messages(), err
-		}
-		toolResults := make(schema.Messages, 0, len(results))
-		for index := range results {
-			// 工具自身的失败同样作为一条 IsError 的工具消息回给模型，
-			// 让模型自己决定重试还是换条路；只有调度层面的失败才中断。
-			result, err := results[index].ResultMessage()
-			if err != nil {
-				// 结束事件缺身份是调度器坏了，不是工具失败：工具失败会以
-				// IsError 事件表达，不会走到这里。
-				return state.messages(), pierrors.ErrInternal.Wrap(err)
-			}
-			// 追加的是消息值本身：取一条复用变量的地址会让序列里的每条工具结果
-			// 都指向同一份内存。
-			state.produced = append(state.produced, result)
-			l.observe(result)
-			toolResults = append(toolResults, result)
-		}
-
-		// 每轮的工具结果写回之后给上层一次机会判定这是不是循环。判定放在这里
-		// 而不是每轮开头：只有"还要开下一轮"的那些轮才有这个问题，模型不再要
-		// 工具时上面已经返回了。返回错误就是收尾，与上面 maxTurns 同一种形状
-		// ——带消息返回，不中断正在跑的东西。
-		if l.afterTurn != nil {
-			if err = l.afterTurn(ctx, TurnReport{
-				Index:       turn,
-				Message:     assistant,
-				ToolResults: toolResults,
-			}); err != nil {
-				return state.messages(), err
-			}
-		}
 	}
+}
+
+// step 跑一轮：交付插话 → 压缩 → 调模型 → 写回消息 → 执行工具 → 循环检测。
+// 返回 stop 表示模型这一轮不再要求调用工具，运行到此结束。
+//
+// 整段括在一个 turn Span 里。抽成函数是为了让 Span 有一个包得住整轮的进出点：
+// run 里有六个返回点，手工 End 会漏；这里只有一个出口，Span 一定只结束一次。
+// 搬迁之外没有别处改动，消息序列的推进顺序与原来一字不差。
+func (l *Loop) step(ctx context.Context, state *runState, turn int) (stop bool, err error) {
+	err = contexttracing.WithSpan(ctx, observability.SpanNameTurn,
+		func(ctx context.Context) error {
+			contexttracing.WithKV(ctx,
+				contexttracing.KV(observability.AttrTurnIndex, turn),
+				contexttracing.KV(observability.AttrToolsAvailable, len(state.availableTools)),
+			)
+
+			// 排队中的插话先交付，再让压缩做窗口判定。反过来（先压缩后交付）的话，
+			// 这批消息不在 turn.extra() 里（pi/agent.go 的 compactBeforeTurn 用它
+			// 判要不要压），压缩既不会因为它们而触发、也不会在压完之后把它们的
+			// 体量算进去——写得多就直接把请求顶过窗口，运行被 provider 的 20003
+			// 打掉。
+			//
+			// 运行开始前写入的消息也在这里交付：循环第一次进来就走到这里。
+			l.deliver(l.drainSteering(), state)
+
+			// 每轮调用模型之前给上层一次机会改写历史段（压缩就挂在这里）。返回 nil
+			// 表示不改写；报错则带上已经产生的部分退出。
+			if l.beforeTurn != nil {
+				head, err := l.beforeTurn(ctx, state.turn())
+				if err != nil {
+					return err
+				}
+				if head != nil {
+					state.head = head
+				}
+			}
+
+			// 压缩期间写进来的消息在这里补捞：压缩要调一次模型，慢的话是几秒，
+			// 那段时间写入的不该等到下一轮。pi.dev 在 agent-loop.ts:203 单独留了
+			// 一个"压缩完再捞一次"的点，理由相同。
+			l.deliver(l.drainSteering(), state)
+
+			message, err := l.complete(ctx, state)
+			if err != nil {
+				return err
+			}
+			// Provider 的 Stream.Result 已经把返回类型收窄为助手消息，Loop 不再需要
+			// 对通用 Message 做运行时类型断言。
+			assistant := message
+			// 模型消息先入列：工具结果必须紧跟在发起调用的那条助手消息之后，
+			// 两家协议都按这个顺序还原上下文。
+			state.produced = append(state.produced, message)
+			l.observe(message)
+
+			if len(assistant.ToolCalls) == 0 {
+				// 模型不再要求调用工具：这一轮就是最后一轮。停止信号只能从
+				// 这里出去——闭包没有别的办法告诉 run"正常结束"而不是"出错"。
+				stop = true
+
+				return nil
+			}
+			if l.scheduler == nil {
+				return pierrors.ErrInternal.Wrap(fmt.Errorf(
+					"模型请求调用工具 %q，但本轮运行没有接入工具调度器", assistant.ToolCalls[0].Name))
+			}
+
+			contexttracing.WithKV(ctx,
+				contexttracing.KV(observability.AttrToolsRequested, len(assistant.ToolCalls)))
+
+			results, err := l.scheduler.ExecuteBatch(ctx, assistant.ToolCalls)
+			if err != nil {
+				return err
+			}
+			toolResults := make(schema.Messages, 0, len(results))
+			for index := range results {
+				// 工具自身的失败同样作为一条 IsError 的工具消息回给模型，
+				// 让模型自己决定重试还是换条路；只有调度层面的失败才中断。
+				result, err := results[index].ResultMessage()
+				if err != nil {
+					// 结束事件缺身份是调度器坏了，不是工具失败：工具失败会以
+					// IsError 事件表达，不会走到这里。
+					return pierrors.ErrInternal.Wrap(err)
+				}
+				// 追加的是消息值本身：取一条复用变量的地址会让序列里的每条工具结果
+				// 都指向同一份内存。
+				state.produced = append(state.produced, result)
+				l.observe(result)
+				toolResults = append(toolResults, result)
+			}
+
+			// 每轮的工具结果写回之后给上层一次机会判定这是不是循环。判定放在这里
+			// 而不是每轮开头：只有"还要开下一轮"的那些轮才有这个问题，模型不再要
+			// 工具时上面已经返回了。返回错误就是收尾，与上面 maxTurns 同一种形状
+			// ——带消息返回，不中断正在跑的东西。
+			if l.afterTurn != nil {
+				if err = l.afterTurn(ctx, TurnReport{
+					Index:       turn,
+					Message:     assistant,
+					ToolResults: toolResults,
+				}); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		},
+		contexttracing.WithErrorClassifier(observability.ClassifyError),
+	)
+
+	return stop, err
 }
 
 // complete 调用一次模型，边生成边把文本增量交给观察者，返回这一轮的完整消息。
