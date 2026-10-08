@@ -7,11 +7,13 @@ import (
 	"strings"
 	"sync/atomic"
 
+	contexttracing "github.com/PycMono/go-context-sdk/tracing"
 	"github.com/PycMono/go-harness/pi/ai"
 	"github.com/PycMono/go-harness/pi/ai/providers"
 	pierrors "github.com/PycMono/go-harness/pi/error"
 	"github.com/PycMono/go-harness/pi/extension"
 	"github.com/PycMono/go-harness/pi/middleware"
+	"github.com/PycMono/go-harness/pi/observability"
 	"github.com/PycMono/go-harness/pi/schema"
 	"github.com/PycMono/go-harness/pi/session"
 	"github.com/PycMono/go-harness/pi/tools"
@@ -115,6 +117,24 @@ func newAgent(ctx context.Context, provider ai.Provider, opts *Options) (*Agent,
 	if opts.Session == nil {
 		return nil, pierrors.ErrInitialization.Wrap(errors.New("session must not be nil"))
 	}
+	// 观测装配要用 ProviderOptions 里的归属信息（平台、模型、协议），所以
+	// 这里也判一次空。NewAgent 已经判过；newAgent 被测试直接调用，判空不能
+	// 只留在上层。
+	if opts.ProviderOptions == nil {
+		return nil, pierrors.ErrInitialization.Wrap(errors.New("provider options must not be nil"))
+	}
+
+	// 观测装配：装饰顺序固定在 observability.Wrap 里，拿到的是最外层。
+	// 没装 OTel Provider 时两层都是透传，代价是两次函数调用。
+	traced, err := observability.Wrap(
+		provider,
+		opts.ProviderOptions.ID,
+		opts.ProviderOptions.Model,
+		string(opts.ProviderOptions.Protocol),
+	)
+	if err != nil {
+		return nil, pierrors.ErrInitialization.Wrap(err)
+	}
 
 	// 获取 tools 下面的 4 个默认的工具
 	newTools := impl.NewDefaultTools(opts.WorkDir)
@@ -146,7 +166,7 @@ func newAgent(ctx context.Context, provider ai.Provider, opts *Options) (*Agent,
 	agent := &Agent{
 		contextBuilder: NewContextBuilder(opts.WorkDir),
 		session:        opts.Session,
-		provider:       provider,
+		provider:       traced,
 		window:         session.NewWindow(int64(opts.ProviderOptions.ContextWindow)),
 		onCompaction:   opts.CompactionObserver,
 		guard:          newLoopGuard(opts.LoopGuardTurns),
@@ -159,7 +179,7 @@ func newAgent(ctx context.Context, provider ai.Provider, opts *Options) (*Agent,
 	//
 	// 装配不做条件判断：关不关由 guard.limit 的值决定，observe 自己吞掉。
 	agent.loop = NewLoop(
-		provider,
+		traced,
 		WithScheduler(tools.NewScheduler(registry, maxParallel, opts.Observer, middleware.Defaults()...)),
 		WithTextObserver(opts.TextObserver),
 		WithMaxTurns(opts.MaxTurns),
@@ -219,31 +239,60 @@ func (a *Agent) Run(ctx context.Context, input *RunInput) (*RunOutput, error) {
 
 	// 一个 Run 一轮账：上一轮的写入错误、本轮起点与循环检测的计数都不带进
 	// 这一轮。检测计数必须在这里清——它记的是"连续几轮"，跨 Run 留着就会把
-	// 两次不相干的运行接成一段。
+	// 两次不相干的运行接成一段。这三行是账本不是运行，留在 Span 之外。
 	a.writeErr = nil
 	a.headLeafID = ""
 	a.guard.reset()
-	runContext, err := a.prepareRunContext(ctx, input)
-	if err != nil {
+
+	// 整次运行括一个 Span：准备上下文、模型调用、工具执行、压缩都是它的子
+	// Span，一次运行在追踪后端上是一棵树。属性在闭包里写而不是起始选项里写，
+	// 是为了让 agent.go 不 import otel 的 trace 包。
+	//
+	// 闭包的返回值与 Run 的返回值是同一件事：Run 返回错误 ⇔ 这个 Span 是红的。
+	// 唯一在 Span 之外的是上面那三个入口校验——那是调用方写错了参数，这一次
+	// 运行根本没开始，不该在 trace 上留一个 Run。
+	var (
+		messages schema.Messages
+		started  bool
+	)
+	err := contexttracing.WithSpan(ctx, observability.SpanNameRun, func(ctx context.Context) error {
+		contexttracing.WithKV(ctx,
+			contexttracing.OperationName("invoke_agent"),
+			contexttracing.KV(observability.AttrGenAIAgentName, observability.AgentName),
+		)
+
+		// 准备上下文也会失败（本轮输入拼不出来、历史读不出来），所以它进 Span：
+		// 不进的话 Run 报了错、trace 上却什么都没有。
+		runContext, err := a.prepareRunContext(ctx, input)
+		if err != nil {
+			return err
+		}
+		started = true
+
+		produced, runErr := a.loop.run(ctx, runContext)
+		messages = produced
+
+		// 运行失败时同样返回已经产生的消息序列，调用方可以据此看到模型跑到哪
+		// 一步才出的问题。会话写入失败比模型出错更隐蔽：消息可能已经发给模型了，
+		// 但盘上没有，下一轮重建出来的历史就缺一段，它不算"运行成功"，Span 也要
+		// 跟着红。
+		//
+		// 两个错可能同时发生：运行错在前、写入错在后，两个都带上——只报运行错会
+		// 吞掉"盘上历史缺了一段"，只报写入错会吞掉"模型为什么停"。CodeOf 走
+		// errors.As、先左后右，所以拿到的仍是运行错的码；errors.Is 能同时找到
+		// 写入失败的原因。
+		return errors.Join(runErr, a.writeErr)
+	},
+		contexttracing.WithErrorClassifier(observability.ClassifyError),
+	)
+	// started 是准备阶段的成败：准备失败时没有消息序列可返回，与原来一样返回
+	// nil 输出；运行中途失败时返回已经产生的部分，调用方可以据此看到模型跑到
+	// 哪一步才出的问题。
+	if !started {
 		return nil, err
 	}
 
-	messages, err := a.loop.run(ctx, runContext)
-	// 运行失败时同样返回已经产生的消息序列，调用方可以据此看到模型跑到哪
-	// 一步才出的问题。两个错可能同时发生：运行错在前、写入错在后，两个都带上
-	// ——只报运行错会吞掉"盘上历史缺了一段"，只报写入错会吞掉"模型为什么停"。
-	// CodeOf 走 errors.As，先左后右，所以拿到的仍是运行错的码；errors.Is 能同时
-	// 找到写入失败的原因。
-	if err != nil {
-		return &RunOutput{message: messages}, errors.Join(err, a.writeErr)
-	}
-	// 会话没写下去比模型出错更隐蔽：消息可能已经发给模型了，但盘上没有，
-	// 下一轮重建出来的历史就缺一段，必须让调用方知道。
-	if a.writeErr != nil {
-		return &RunOutput{message: messages}, a.writeErr
-	}
-
-	return &RunOutput{message: messages}, nil
+	return &RunOutput{message: messages}, err
 }
 
 // prepareRunContext 准备执行 loop 的上下文
